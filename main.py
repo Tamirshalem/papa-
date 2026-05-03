@@ -786,7 +786,8 @@ def api_matches():
             rows = conn.run("""SELECT mid,home,away,league,minute,score_home,score_away,total_goals,period,updated_at
                 FROM matches WHERE updated_at>NOW()-INTERVAL '10 minutes'
                 ORDER BY updated_at DESC LIMIT 100""")
-            return jsonify([{"mid":r[0],"home":r[1],"away":r[2],"league":r[3],"minute":r[4],
+            return jsonify([{"mid":r[0],"home":r[1],"away":r[2],"home_team":r[1],"away_team":r[2],
+                "league":r[3],"minute":r[4],
                 "score_home":r[5],"score_away":r[6],"total_goals":r[7],"period":r[8],"updated_at":str(r[9])} for r in rows])
         finally: conn.close()
     except Exception as e: log.error(f"api_matches: {e}"); return jsonify([])

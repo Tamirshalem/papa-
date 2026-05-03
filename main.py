@@ -909,6 +909,28 @@ def api_analytics():
         finally: conn.close()
     except: return jsonify({"goals":0,"snapshots":0,"trades":0,"obs":0,"hit_rate":0})
 
+@app.route("/api/debug_odds")
+def api_debug_odds():
+    """Debug: fetch raw odds for first live event"""
+    try:
+        r = requests.get("https://api.odds-api.io/v3/events",
+            params={"apiKey":ODDSAPI_KEY,"sport":"football","status":"live","limit":3},
+            timeout=10)
+        events = r.json() if isinstance(r.json(), list) else r.json().get("data",[])
+        result = {"events_status": r.status_code, "events_count": len(events), "api_key_set": bool(ODDSAPI_KEY)}
+        if events:
+            eid = str(events[0].get("id",""))
+            result["first_event"] = events[0]
+            # Try to get odds
+            r2 = requests.get(f"https://api.odds-api.io/v3/events/{eid}/odds",
+                params={"apiKey":ODDSAPI_KEY}, timeout=10)
+            result["odds_status"] = r2.status_code
+            try: result["odds_raw"] = r2.json()
+            except: result["odds_text"] = r2.text[:500]
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error":str(e)})
+
 @app.route("/api/insights")
 def api_insights():
     try:
@@ -925,26 +947,51 @@ def api_ai_live():
 
 @app.route("/api/run_ai", methods=["POST"])
 def api_run_ai():
-    if not ANTHROPIC_API_KEY: return jsonify({"error":"No API key"}),400
+    if not ANTHROPIC_API_KEY: return jsonify({"error":"No ANTHROPIC_API_KEY"}),400
     try:
         conn=get_db()
         try:
             goals=conn.run("SELECT minute,score_before,period FROM goals ORDER BY goal_time DESC LIMIT 200")
             rules=conn.run("SELECT rule_name,status,total_signals,win_rate,profit FROM rules ORDER BY total_signals DESC")
-            trades=conn.run("SELECT result,COUNT(*) FROM trades WHERE result!='pending' GROUP BY result")
-            prompt=f"""PapaGoal AI analysis. {len(goals)} goals. Trades: {[(r[0],r[1]) for r in trades]}.
-Goals: {[(g[0],g[1],g[2]) for g in goals[:20]]}. Rules: {[(r[0],r[1],r[2]) for r in rules]}.
-1) Which lines/minutes show edge? 2) Which rules work? 3) New rule recommendation? Say insufficient data if <20 cases."""
+            matches=conn.run("SELECT COUNT(*) FROM matches")[0][0]
+            try:
+                trades=conn.run("SELECT result,COUNT(*) FROM trades WHERE result!='pending' GROUP BY result")
+            except: trades=[]
+
+            prompt=f"""You are PapaGoal AI — a football betting market analyst.
+
+Current data:
+- {matches} live matches tracked
+- {len(goals)} goals recorded so far
+- Rules: {[(r[0],r[1],r[2]) for r in rules]}
+- Resolved trades: {[(r[0],r[1]) for r in trades]}
+
+Goals sample: {[(g[0],g[1],g[2]) for g in goals[:20]]}
+
+{"NOTE: Very early stage — only " + str(len(goals)) + " goals collected. Analysis will be limited." if len(goals) < 20 else ""}
+
+Please analyze:
+1. Which Over/Under lines and minute ranges show potential edge?
+2. Which rules look promising based on available data?
+3. What patterns should we watch for?
+4. Recommended next steps for data collection.
+
+Be honest about data limitations. Say 'insufficient data' for specific claims needing more samples."""
+
             resp=requests.post("https://api.anthropic.com/v1/messages",
                 headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"},
-                json={"model":"claude-sonnet-4-20250514","max_tokens":1200,"messages":[{"role":"user","content":prompt}]},timeout=30)
+                json={"model":"claude-sonnet-4-20250514","max_tokens":1200,"messages":[{"role":"user","content":prompt}]},
+                timeout=30)
             if resp.status_code==200:
                 text=resp.json()["content"][0]["text"]
-                conn.run("INSERT INTO insights (itype,content,goals_n,rules_n) VALUES ('market_analysis',:a,:b,:c)",a=text,b=len(goals),c=len(rules))
+                conn.run("INSERT INTO insights (itype,content,goals_n,rules_n) VALUES ('market_analysis',:a,:b,:c)",
+                    a=text,b=len(goals),c=len(rules))
                 return jsonify({"status":"ok"})
-            return jsonify({"error":f"Claude {resp.status_code}"}),500
+            return jsonify({"error":f"Claude API returned {resp.status_code}: {resp.text[:200]}"}),500
         finally: conn.close()
-    except Exception as e: return jsonify({"error":str(e)}),500
+    except Exception as e:
+        log.error(f"run_ai: {e}")
+        return jsonify({"error":str(e)}),500
 
 @app.route("/api/ai_rules", methods=["POST"])
 def api_ai_rules():

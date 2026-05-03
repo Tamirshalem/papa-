@@ -248,7 +248,9 @@ def collect():
                             VALUES (:a,:b,:c,:d,:e,:f,:g,:h,:i,:j)""",
                             a=mid,b=p["eid"],c=p["home"],d=p["away"],e=p["league"],
                             f=p["minute"],g=p["score_h"],h=p["score_a"],i=p["total"],j=p["period"])
-                except Exception as me: log.debug(f"Match: {me}"); continue
+                except Exception as me:
+                    log.debug(f"Match upsert: {me}")
+                    # Don't continue — still fetch odds even if match upsert failed
                 prev = last_goals.get(mid)
                 if prev is not None and p["total"] > prev:
                     log.info(f"GOAL: {p['home']} vs {p['away']} {p['score_h']}-{p['score_a']} min:{p['minute']}")

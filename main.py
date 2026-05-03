@@ -55,7 +55,14 @@ def get_db():
     return pg8000.native.Connection(**parse_db(DATABASE_URL))
 
 def init_db():
-    conn = get_db()
+    if not DATABASE_URL:
+        log.error("DATABASE_URL not set — DB skipped")
+        return
+    try:
+        conn = get_db()
+    except Exception as e:
+        log.error(f"DB connect failed: {e}")
+        return
     try:
         conn.run("""CREATE TABLE IF NOT EXISTS matches (
             id SERIAL PRIMARY KEY, mid TEXT UNIQUE NOT NULL, eid TEXT,
@@ -258,9 +265,15 @@ def collect():
     except Exception as e: log.error(f"Collect: {e}")
 
 def collector_loop():
+    if not DATABASE_URL or not ODDSAPI_KEY:
+        log.warning("Missing env vars — collector paused")
+        return
     time.sleep(5)
     while True:
-        collect()
+        try:
+            collect()
+        except Exception as e:
+            log.error(f"Collector: {e}")
         time.sleep(POLL_INTERVAL)
 
 HTML = """<!DOCTYPE html>

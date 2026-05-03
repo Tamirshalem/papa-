@@ -259,6 +259,40 @@ def collect():
                             e=p["period"],f=p["home"],g=p["away"],h=p["league"])
                     except Exception as ge: log.error(f"Goal: {ge}")
                 last_goals[mid] = p["total"]
+
+                # Fetch odds from Bet365
+                markets = []
+                try:
+                    r_odds = requests.get("https://api.odds-api.io/v3/odds",
+                        params={"apiKey":ODDSAPI_KEY,"eventId":p["eid"],"bookmakers":"Bet365"},
+                        timeout=6)
+                    if r_odds.status_code == 200:
+                        od = r_odds.json()
+                        bk_markets = od.get("bookmakers",{}).get("Bet365",[]) or []
+                        for mkt in bk_markets:
+                            mname = mkt.get("name","")
+                            odds_list = mkt.get("odds",[])
+                            # Totals = FT Over/Under, Totals HT = H1 Over/Under
+                            if mname in ("Totals","Totals HT","Goals Over/Under"):
+                                mtype = "H1" if "HT" in mname else "FT"
+                                for o in odds_list:
+                                    line = float(o.get("hdp") or o.get("line") or 2.5)
+                                    over = float(o.get("over") or 0) or None
+                                    under = float(o.get("under") or 0) or None
+                                    if over and over > 1:
+                                        markets.append({"mtype":mtype,"line":line,"over":over,"under":under})
+                                        k = ckey(mid,mtype,str(line))
+                                        if k not in opening_cache:
+                                            opening_cache[k] = {"over":over,"under":under}
+                        if markets:
+                            log.debug(f"Odds: {p['home']} vs {p['away']} — {len(markets)} markets")
+                except Exception as oe:
+                    log.debug(f"Odds: {oe}")
+
+                if markets:
+                    check_rules(conn,mid,p["home"],p["away"],p["league"],
+                               p["minute"],p["score_h"],p["score_a"],p["period"],
+                               markets,held_map)
             validate_trades(conn)
             log.info(f"Saved | live:{live_cnt}/{len(events)}")
         finally: conn.close()

@@ -285,9 +285,9 @@ def collect():
                                         if k not in opening_cache:
                                             opening_cache[k] = {"over":over,"under":under}
                         if markets:
-                            log.debug(f"Odds: {p['home']} vs {p['away']} — {len(markets)} markets")
+                            log.info(f"📊 Odds: {p['home']} vs {p['away']} — {len(markets)} markets")
                 except Exception as oe:
-                    log.debug(f"Odds: {oe}")
+                    log.warning(f"📊 Odds error: {oe}")
 
                 if markets:
                     check_rules(conn,mid,p["home"],p["away"],p["league"],

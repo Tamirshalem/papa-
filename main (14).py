@@ -1,0 +1,972 @@
+import os, time, json, logging, threading, re
+from datetime import datetime, timezone
+from urllib.parse import urlparse
+from flask import Flask, jsonify, render_template_string, request
+import pg8000.native
+import requests
+
+ODDSAPI_KEY       = os.environ.get("ODDSAPI_KEY", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+DATABASE_URL      = os.environ.get("DATABASE_URL", "")
+PORT              = int(os.environ.get("PORT", 8080))
+POLL_INTERVAL     = 30
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("papagoal")
+app = Flask(__name__)
+
+EXPECTED = {
+    "H1_0.5": {0:1.25,5:1.28,10:1.32,15:1.38,20:1.45,25:1.55,30:1.68,35:1.85,40:2.10,45:2.50},
+    "H1_1.5": {0:2.10,5:2.15,10:2.22,15:2.32,20:2.45,25:2.65,30:2.90,35:3.20,40:3.60,45:4.20},
+    "H1_2.5": {0:3.50,5:3.60,10:3.75,15:3.95,20:4.20,25:4.60,30:5.20,35:6.00,40:7.50,45:10.0},
+    "FT_0.5": {0:1.10,10:1.12,20:1.15,30:1.20,40:1.28,50:1.38,60:1.55,70:1.85,80:2.50,88:4.00},
+    "FT_1.5": {0:1.85,10:1.88,20:1.92,30:2.05,40:2.25,50:2.55,60:3.00,70:3.80,80:5.50,88:9.00},
+    "FT_2.5": {0:2.80,10:2.85,20:2.95,30:3.15,40:3.50,50:4.00,60:4.80,70:6.50,80:10.0,88:18.0},
+    "FT_3.5": {0:5.50,10:5.60,20:5.80,30:6.20,40:7.00,50:8.50,60:11.0,70:16.0,80:28.0,88:55.0},
+}
+
+def get_expected(mtype, line, minute):
+    key = f"{mtype}_{line}"
+    curve = EXPECTED.get(key)
+    if not curve: return None
+    keys = sorted(curve.keys())
+    m = min(max(minute, 0), keys[-1])
+    for i, k in enumerate(keys):
+        if m <= k:
+            if i == 0: return curve[k]
+            prev = keys[i-1]
+            r = (m - prev) / (k - prev)
+            return round(curve[prev] + r * (curve[k] - curve[prev]), 3)
+    return curve[keys[-1]]
+
+def calc_pressure(real, opening, expected):
+    if not opening or not real or not expected or opening == 0: return 0
+    rise = real / opening
+    exp_rise = expected / opening
+    if exp_rise <= 0: return 0
+    return max(0, min(100, int((1 - rise / exp_rise) * 100)))
+
+def parse_db(url):
+    p = urlparse(url)
+    return {"host":p.hostname,"port":p.port or 5432,"database":p.path.lstrip("/"),
+            "user":p.username,"password":p.password,"ssl_context":True}
+
+def get_db():
+    return pg8000.native.Connection(**parse_db(DATABASE_URL))
+
+def init_db():
+    conn = get_db()
+    try:
+        conn.run("""CREATE TABLE IF NOT EXISTS matches (
+            id SERIAL PRIMARY KEY, mid TEXT UNIQUE NOT NULL, eid TEXT,
+            home TEXT DEFAULT '', away TEXT DEFAULT '', league TEXT DEFAULT '',
+            minute INT DEFAULT 0, score_home INT DEFAULT 0, score_away INT DEFAULT 0,
+            total_goals INT DEFAULT 0, period TEXT DEFAULT 'H1',
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        )""")
+        for idx in ["CREATE INDEX IF NOT EXISTS idx_m_mid ON matches(mid)",
+                    "CREATE INDEX IF NOT EXISTS idx_m_upd ON matches(updated_at)"]:
+            try: conn.run(idx)
+            except: pass
+        conn.run("""CREATE TABLE IF NOT EXISTS goals (
+            id SERIAL PRIMARY KEY, mid TEXT NOT NULL, minute INT,
+            goal_time TIMESTAMPTZ DEFAULT NOW(),
+            score_before TEXT, score_after TEXT, period TEXT,
+            home TEXT DEFAULT '', away TEXT DEFAULT '', league TEXT DEFAULT '')""")
+        conn.run("""CREATE TABLE IF NOT EXISTS observations (
+            id SERIAL PRIMARY KEY, mid TEXT NOT NULL,
+            detected_at TIMESTAMPTZ DEFAULT NOW(),
+            home TEXT, away TEXT, league TEXT, rule_id INT, rule_name TEXT,
+            minute INT DEFAULT 0, score TEXT DEFAULT '0-0',
+            mtype TEXT, line FLOAT, over_odd FLOAT, under_odd FLOAT,
+            expected_odd FLOAT, gap FLOAT DEFAULT 0, pressure INT DEFAULT 0,
+            action_type TEXT, selected_side TEXT, entry_odd FLOAT,
+            confidence INT DEFAULT 50, reason TEXT)""")
+        conn.run("""CREATE TABLE IF NOT EXISTS trades (
+            id SERIAL PRIMARY KEY, mid TEXT NOT NULL, rule_id INT, rule_name TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW(), resolved_at TIMESTAMPTZ,
+            home TEXT, away TEXT, league TEXT, mtype TEXT, line FLOAT,
+            side TEXT, action_type TEXT, entry_odd FLOAT, expected_odd FLOAT,
+            entry_min INT DEFAULT 0, entry_goals INT DEFAULT 0,
+            score_entry TEXT DEFAULT '0-0', gap FLOAT DEFAULT 0,
+            pressure INT DEFAULT 0, validation_window TEXT DEFAULT '10m',
+            result TEXT DEFAULT 'pending', profit FLOAT DEFAULT 0, fail_reason TEXT,
+            UNIQUE(mid, rule_id, validation_window))""")
+        conn.run("""CREATE TABLE IF NOT EXISTS rules (
+            id SERIAL PRIMARY KEY, rule_name TEXT UNIQUE NOT NULL,
+            description TEXT, source TEXT DEFAULT 'manual', mtype TEXT,
+            line_min FLOAT, line_max FLOAT, min_min INT, min_max INT,
+            over_min FLOAT, over_max FLOAT, under_min FLOAT, under_max FLOAT,
+            held_min INT DEFAULT 0, action_type TEXT, side TEXT DEFAULT 'over',
+            val_window TEXT DEFAULT '10m', status TEXT DEFAULT 'ACTIVE',
+            is_active BOOLEAN DEFAULT TRUE, total_signals INT DEFAULT 0,
+            wins INT DEFAULT 0, losses INT DEFAULT 0, win_rate FLOAT DEFAULT 0,
+            profit FLOAT DEFAULT 0, created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW())""")
+        conn.run("""CREATE TABLE IF NOT EXISTS insights (
+            id SERIAL PRIMARY KEY, created_at TIMESTAMPTZ DEFAULT NOW(),
+            itype TEXT, content TEXT, goals_n INT DEFAULT 0, rules_n INT DEFAULT 0)""")
+        if conn.run("SELECT COUNT(*) FROM rules")[0][0] == 0:
+            _seed_rules(conn)
+        log.info("DB ready")
+    except Exception as e:
+        log.error(f"DB init: {e}")
+    finally:
+        conn.close()
+
+def _seed_rules(conn):
+    rules = [
+        ("Market Shut","Over FT >=2.80 after min 82","FT",1.5,5.5,82,95,2.80,99.0,None,None,0,"UNDER_HOLDS_10M","under","10m","VALIDATED"),
+        ("Early Drop Signal","Over FT 1.50-1.57 at min 17-20","FT",0.5,1.5,17,20,1.50,1.57,None,None,0,"OVER_LINE_WITHIN_10M","over","10m","PROMISING"),
+        ("H1 Minute 18 Pressure","Over H1 1.40-1.60 at min 15-22","H1",0.5,3.5,15,22,1.40,1.60,None,None,0,"H1_OVER_LINE_BEFORE_HT","over","HT","TESTING"),
+        ("H1 Under 1.66","Under H1 1.60-1.72 at min 30-38","H1",0.5,3.5,30,38,None,None,1.60,1.72,0,"UNDER_HOLDS_TO_HT","under","HT","TESTING"),
+        ("Late FT Goal Hold","Over FT 2.20-2.80 at min 86+","FT",1.5,4.5,86,95,2.20,2.80,None,None,60,"OVER_LINE_BEFORE_FT","over","FT","TESTING"),
+    ]
+    for r in rules:
+        try:
+            conn.run("""INSERT INTO rules (rule_name,description,mtype,line_min,line_max,min_min,min_max,
+                 over_min,over_max,under_min,under_max,held_min,action_type,side,val_window,status)
+                VALUES (:a,:b,:c,:d,:e,:f,:g,:h,:i,:j,:k,:l,:m,:n,:o,:p) ON CONFLICT DO NOTHING""",
+                a=r[0],b=r[1],c=r[2],d=r[3],e=r[4],f=r[5],g=r[6],h=r[7],i=r[8],
+                j=r[9],k=r[10],l=r[11],m=r[12],n=r[13],o=r[14],p=r[15])
+        except Exception as e: log.error(f"Seed: {e}")
+
+price_cache = {}
+opening_cache = {}
+last_goals = {}
+
+def ckey(mid, mtype, line): return f"{mid}_{mtype}_{line}"
+
+def fetch_events():
+    if not ODDSAPI_KEY: log.warning("ODDSAPI_KEY not set"); return []
+    try:
+        r = requests.get("https://api.odds-api.io/v3/events",
+            params={"apiKey":ODDSAPI_KEY,"sport":"football","status":"live","limit":50}, timeout=15)
+        if r.status_code != 200: log.warning(f"Events {r.status_code}: {r.text[:150]}"); return []
+        raw = r.json()
+        events = raw if isinstance(raw,list) else (raw.get("data") or raw.get("events") or [])
+        log.info(f"OddsAPI: {len(events)} live events")
+        return events
+    except Exception as e: log.error(f"fetch_events: {e}"); return []
+
+def parse_event(event):
+    eid = str(event.get("id") or "")
+    home = event.get("home") or ""
+    away = event.get("away") or ""
+    lg = event.get("league") or ""
+    league = lg.get("name","") if isinstance(lg,dict) else str(lg)
+    scores = event.get("scores") or {}
+    score_h = int(scores.get("home") or 0) if isinstance(scores,dict) else 0
+    score_a = int(scores.get("away") or 0) if isinstance(scores,dict) else 0
+    periods = scores.get("periods") or {} if isinstance(scores,dict) else {}
+    period = "H2" if "p2" in periods else "H1"
+    minute = 0
+    try:
+        start = datetime.fromisoformat(event.get("date","").replace("Z","+00:00"))
+        elapsed = (datetime.now(timezone.utc) - start).total_seconds() / 60
+        minute = max(0, min(90, int(elapsed)))
+        if period == "H2" and minute < 45: minute = 45
+    except: pass
+    return {"eid":eid,"home":home,"away":away,"league":league,
+            "minute":minute,"score_h":score_h,"score_a":score_a,
+            "period":period,"total":score_h+score_a}
+
+def validate_trades(conn):
+    try:
+        pending = conn.run("""SELECT id,mid,rule_id,action_type,validation_window,
+            entry_odd,side,mtype,line,created_at,entry_goals
+            FROM trades WHERE result='pending'""")
+    except Exception as e: log.warning(f"Validate: {e}"); return
+    for p in pending:
+        tid,mid,rid,action,val_win,entry_odd,side,mtype,line,created_at,entry_goals = p
+        now = datetime.now(timezone.utc)
+        created = created_at if created_at.tzinfo else created_at.replace(tzinfo=timezone.utc)
+        elapsed = (now - created).total_seconds() / 60
+        try:
+            mrow = conn.run("SELECT score_home,score_away,minute,period,total_goals FROM matches WHERE mid=:a",a=mid)
+            sh,sa,cur_min,cur_period,cur_goals = mrow[0] if mrow else (0,0,0,"FT",0)
+        except: sh,sa,cur_min,cur_period,cur_goals = 0,0,0,"FT",0
+        total_now = (sh or 0)+(sa or 0)
+        goals_since = max(0,total_now-(entry_goals or 0))
+        line_crossed = total_now > float(line or 0)
+        result = fail = None
+        if action == "OVER_LINE_WITHIN_10M":
+            if goals_since>0 and line_crossed: result="win"
+            elif elapsed>12: result,fail="lose","No goal in 10min"
+        elif action == "UNDER_HOLDS_10M":
+            if goals_since>0 and line_crossed: result,fail="lose","Line crossed"
+            elif elapsed>12: result="win"
+        elif action in ("H1_OVER_LINE_BEFORE_HT","H1_GOAL_BEFORE_HT"):
+            ht = cur_period in ("H2","FT") or (cur_period=="H1" and (cur_min or 0)>=46)
+            if ht: result="win" if line_crossed else "lose"; fail="Not crossed by HT" if result=="lose" else None
+            elif elapsed>65: result,fail="lose","HT timeout"
+        elif action == "UNDER_HOLDS_TO_HT":
+            ht = cur_period in ("H2","FT") or (cur_period=="H1" and (cur_min or 0)>=46)
+            if ht: result="win" if goals_since==0 else "lose"; fail="Goal before HT" if result=="lose" else None
+            elif elapsed>65: result,fail="lose","HT timeout"
+        elif action in ("OVER_LINE_BEFORE_FT","GOAL_BY_FT"):
+            if cur_period=="FT": result="win" if line_crossed else "lose"; fail="Not crossed by FT" if result=="lose" else None
+            elif elapsed>35: result,fail="lose","FT timeout"
+        if result:
+            profit = round((float(entry_odd or 1)-1)*100,2) if result=="win" else -100.0
+            try:
+                conn.run("""UPDATE trades SET result=:a,resolved_at=NOW(),profit=:b,fail_reason=:c WHERE id=:d""",
+                    a=result,b=profit,c=fail,d=tid)
+                if result=="win":
+                    conn.run("""UPDATE rules SET wins=wins+1,win_rate=ROUND((wins+1)::float/(wins+losses+1)*100,1),profit=profit+:a,updated_at=NOW() WHERE id=:b""",a=profit,b=rid)
+                else:
+                    conn.run("""UPDATE rules SET losses=losses+1,win_rate=CASE WHEN wins+losses+1>0 THEN ROUND(wins::float/(wins+losses+1)*100,1) ELSE 0 END,profit=profit+:a,updated_at=NOW() WHERE id=:b""",a=profit,b=rid)
+            except Exception as e: log.debug(f"Validate update: {e}")
+
+def collect():
+    try:
+        events = fetch_events()
+        if not events: return
+        conn = get_db()
+        try:
+            live_cnt = 0
+            for event in events:
+                p = parse_event(event)
+                if not p["home"] or not p["away"]: continue
+                mid = f"pg_{p['eid']}"
+                live_cnt += 1
+                try:
+                    updated = conn.run("""UPDATE matches SET home=:b,away=:c,league=:d,minute=:e,
+                        score_home=:f,score_away=:g,total_goals=:h,period=:i,updated_at=NOW()
+                        WHERE mid=:a""",
+                        a=mid,b=p["home"],c=p["away"],d=p["league"],e=p["minute"],
+                        f=p["score_h"],g=p["score_a"],h=p["total"],i=p["period"])
+                    if not updated:
+                        conn.run("""INSERT INTO matches (mid,eid,home,away,league,minute,score_home,score_away,total_goals,period)
+                            VALUES (:a,:b,:c,:d,:e,:f,:g,:h,:i,:j)""",
+                            a=mid,b=p["eid"],c=p["home"],d=p["away"],e=p["league"],
+                            f=p["minute"],g=p["score_h"],h=p["score_a"],i=p["total"],j=p["period"])
+                except Exception as me: log.debug(f"Match: {me}"); continue
+                prev = last_goals.get(mid)
+                if prev is not None and p["total"] > prev:
+                    log.info(f"GOAL: {p['home']} vs {p['away']} {p['score_h']}-{p['score_a']} min:{p['minute']}")
+                    try:
+                        conn.run("""INSERT INTO goals (mid,minute,score_before,score_after,period,home,away,league)
+                            VALUES (:a,:b,:c,:d,:e,:f,:g,:h)""",
+                            a=mid,b=p["minute"],c=str(prev),d=f"{p['score_h']}-{p['score_a']}",
+                            e=p["period"],f=p["home"],g=p["away"],h=p["league"])
+                    except Exception as ge: log.error(f"Goal: {ge}")
+                last_goals[mid] = p["total"]
+            validate_trades(conn)
+            log.info(f"Saved | live:{live_cnt}/{len(events)}")
+        finally: conn.close()
+    except Exception as e: log.error(f"Collect: {e}")
+
+def collector_loop():
+    time.sleep(5)
+    while True:
+        collect()
+        time.sleep(POLL_INTERVAL)
+
+HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>PapaGoal</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@300;400;600;700;900&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0A0F1E;--bg2:#0F172A;--card:#131929;--card2:#1a2235;--border:#1e2d45;--border2:#243452;--blue:#3B82F6;--green:#10B981;--red:#EF4444;--yellow:#F59E0B;--purple:#8B5CF6;--text:#E2E8F0;--muted:#64748B}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;min-height:100vh;display:flex}
+.sidebar{width:220px;min-height:100vh;background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;position:fixed;top:0;left:0;bottom:0;z-index:100}
+.logo{padding:20px 16px;border-bottom:1px solid var(--border)}
+.logo-main{font-family:'JetBrains Mono',monospace;font-size:17px;font-weight:700;color:#fff;letter-spacing:2px}
+.logo-main span{color:var(--blue)}
+.logo-sub{font-size:10px;color:var(--muted);margin-top:2px}
+.nav{flex:1;padding:12px 8px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:8px;font-size:13px;color:var(--muted);cursor:pointer;transition:all 0.15s;margin-bottom:2px;border:none;background:none;width:100%;text-align:left;font-family:'Inter',sans-serif}
+.nav-item:hover{background:var(--card);color:var(--text)}
+.nav-item.active{background:rgba(59,130,246,0.15);color:var(--blue)}
+.main{margin-left:220px;flex:1}
+.page{display:none;padding:24px;max-width:1300px}
+.page.active{display:block}
+.ph{margin-bottom:20px;display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px}
+.pt{font-size:22px;font-weight:700}
+.ps{font-size:12px;color:var(--muted);font-family:'JetBrains Mono',monospace;margin-top:4px}
+.sr{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:20px}
+.sc{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:14px}
+.sn{font-size:26px;font-weight:900;font-family:'JetBrains Mono',monospace}
+.sl{font-size:11px;color:var(--muted);margin-top:4px}
+.stit{font-size:11px;letter-spacing:3px;color:var(--muted);text-transform:uppercase;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--border)}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:10px;transition:border-color 0.2s}
+.card.goal{border-color:rgba(59,130,246,0.5);background:linear-gradient(135deg,rgba(59,130,246,0.05),var(--card))}
+.card.win{border-color:rgba(16,185,129,0.5)}
+.card.lose{border-color:rgba(239,68,68,0.4)}
+.card.hot{border-color:rgba(59,130,246,0.8);box-shadow:0 0 15px rgba(59,130,246,0.15)}
+.ctop{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;gap:8px}
+.mn{font-size:15px;font-weight:700}
+.ml{font-size:11px;color:var(--muted);margin-top:2px}
+.bgs{display:flex;gap:5px;align-items:center;flex-wrap:wrap}
+.bg{padding:3px 8px;border-radius:5px;font-size:11px;font-weight:600;font-family:'JetBrains Mono',monospace}
+.bgb{background:rgba(59,130,246,0.15);color:var(--blue);border:1px solid rgba(59,130,246,0.3)}
+.bgg{background:rgba(16,185,129,0.12);color:var(--green);border:1px solid rgba(16,185,129,0.3)}
+.bgr{background:rgba(239,68,68,0.12);color:var(--red);border:1px solid rgba(239,68,68,0.3)}
+.bgy{background:rgba(245,158,11,0.12);color:var(--yellow);border:1px solid rgba(245,158,11,0.3)}
+.bgp{background:rgba(139,92,246,0.12);color:var(--purple);border:1px solid rgba(139,92,246,0.3)}
+.or{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+.ot{background:var(--card2);border:1px solid var(--border2);border-radius:6px;padding:5px 10px;font-family:'JetBrains Mono',monospace;font-size:12px;display:flex;flex-direction:column;align-items:center;gap:1px;min-width:60px}
+.ol{font-size:9px;color:var(--muted);letter-spacing:1px}
+.ov{font-size:13px;font-weight:700}
+.rec-box{background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.3);border-radius:8px;padding:12px;margin-bottom:8px}
+.rec-title{font-size:13px;font-weight:700;color:var(--blue);margin-bottom:6px}
+.rec-row{display:flex;gap:16px;font-size:12px;color:var(--muted);flex-wrap:wrap}
+.rec-val{color:var(--text);font-weight:600;font-family:'JetBrains Mono',monospace}
+.pbar{height:4px;background:var(--border2);border-radius:2px;margin:6px 0;overflow:hidden}
+.pfill{height:100%;border-radius:2px}
+.pb6{height:6px;background:var(--card2);border-radius:3px;overflow:hidden;margin:3px 0}
+.pf6{height:100%;border-radius:3px}
+.status-badge{padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;font-family:'JetBrains Mono',monospace}
+.s-validated{background:rgba(16,185,129,0.15);color:var(--green)}
+.s-promising{background:rgba(59,130,246,0.15);color:var(--blue)}
+.s-testing{background:rgba(245,158,11,0.15);color:var(--yellow)}
+.s-rejected{background:rgba(239,68,68,0.15);color:var(--red)}
+.s-dangerous{background:rgba(239,68,68,0.2);color:var(--red)}
+.s-active{background:rgba(139,92,246,0.15);color:var(--purple)}
+.toggle{padding:4px 12px;border-radius:6px;font-size:11px;font-weight:700;cursor:pointer;border:1px solid transparent;font-family:'JetBrains Mono',monospace;transition:all 0.2s}
+.ton{background:rgba(16,185,129,0.15);color:var(--green);border-color:rgba(16,185,129,0.3)!important}
+.toff{background:rgba(255,255,255,0.05);color:var(--muted);border-color:var(--border)!important}
+.abtn{background:rgba(139,92,246,0.1);border:1px solid rgba(139,92,246,0.3);color:var(--purple);border-radius:8px;padding:9px 18px;font-size:13px;font-family:'Inter',sans-serif;font-weight:600;cursor:pointer;transition:all 0.2s}
+.abtn:hover{background:rgba(139,92,246,0.2)}
+.abtn:disabled{opacity:0.5;cursor:not-allowed}
+.otg{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-top:10px}
+.otc{background:var(--card2);border-radius:6px;padding:6px;text-align:center}
+.empty{text-align:center;padding:60px 20px;color:var(--muted)}
+.ldot{width:8px;height:8px;border-radius:50%;background:var(--blue);animation:blink 1.2s infinite;display:inline-block;margin-right:6px}
+.upd{font-size:11px;color:var(--muted);font-family:'JetBrains Mono',monospace}
+.tc{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0.2}}
+::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:var(--bg)}::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
+@media(max-width:900px){.sidebar{width:52px}.main{margin-left:52px}.sidebar .nav-item span:last-child,.logo-sub,.logo-main{display:none}.sr{grid-template-columns:repeat(2,1fr)}.tc{grid-template-columns:1fr}.otg{grid-template-columns:repeat(3,1fr)}}
+</style></head>
+<body>
+<div class="sidebar">
+  <div class="logo"><div class="logo-main">PAPA<span>GOAL</span></div><div class="logo-sub">READ THE MARKET</div></div>
+  <nav class="nav">
+    <button class="nav-item active" onclick="show('live',this)"><span>📡</span><span>Live Dashboard</span></button>
+    <button class="nav-item" onclick="show('goals',this)"><span>⚽</span><span>Goals</span></button>
+    <button class="nav-item" onclick="show('trades',this)"><span>📈</span><span>Simulation</span></button>
+    <button class="nav-item" onclick="show('obs',this)"><span>🔥</span><span>Observations</span></button>
+    <button class="nav-item" onclick="show('rules',this)"><span>📋</span><span>Rules Engine</span></button>
+    <button class="nav-item" onclick="show('analytics',this)"><span>📊</span><span>Analytics</span></button>
+    <button class="nav-item" onclick="show('ai',this)"><span>🤖</span><span>AI Insights</span></button>
+    <button class="nav-item" onclick="show('debug',this)"><span>🔧</span><span>API Debug</span></button>
+  </nav>
+</div>
+<div class="main">
+
+<div class="page active" id="p-live">
+  <div class="ph"><div><div class="pt"><span class="ldot"></span>Live Dashboard</div><div class="ps">Don't predict football. Read the market.</div></div><div class="upd" id="upd">Updating...</div></div>
+  <div class="sr">
+    <div class="sc"><div class="sn" style="color:var(--blue)" id="sl">—</div><div class="sl">Live Matches</div></div>
+    <div class="sc"><div class="sn" style="color:var(--green)" id="sh">—</div><div class="sl">Active Signals</div></div>
+    <div class="sc"><div class="sn" style="color:var(--yellow)" id="sg">—</div><div class="sl">Goals Today</div></div>
+    <div class="sc"><div class="sn" style="color:var(--purple)" id="st">—</div><div class="sl">Open Trades</div></div>
+  </div>
+  <div class="stit">🎯 Active Recommendations</div>
+  <div id="live-cards"><div class="empty"><div style="font-size:42px">📡</div><div>Scanning live matches...</div></div></div>
+  <div class="stit" style="margin-top:20px">📡 All Live Matches</div>
+  <div id="all-matches"><div class="empty" style="padding:20px">Loading matches...</div></div>
+</div>
+
+<div class="page" id="p-goals">
+  <div class="ph"><div><div class="pt">⚽ Goals Detected</div><div class="ps">Odds before each goal – core learning data</div></div></div>
+  <div id="goals-list"><div class="empty"><div style="font-size:42px">⚽</div><div>Loading goals...</div></div></div>
+</div>
+
+<div class="page" id="p-trades">
+  <div class="ph"><div><div class="pt">📈 Simulation</div><div class="ps">Paper Trading – measuring rule accuracy</div></div></div>
+  <div id="trades-content"><div class="empty"><div style="font-size:42px">📈</div><div>Loading...</div></div></div>
+</div>
+
+<div class="page" id="p-obs">
+  <div class="ph"><div><div class="pt">🔥 Observations</div><div class="ps">All signals from last 3 hours</div></div></div>
+  <div id="obs-list"><div class="empty"><div style="font-size:42px">🔥</div><div>Loading...</div></div></div>
+</div>
+
+<div class="page" id="p-rules">
+  <div class="ph">
+    <div><div class="pt">📋 Rules Engine</div><div class="ps">Rule lifecycle · hit rates · AI suggestions</div></div>
+    <button class="abtn" onclick="runAIRules()" id="ai-rules-btn">🤖 AI: Improve Rules</button>
+  </div>
+  <div class="sr">
+    <div class="sc"><div class="sn" style="color:var(--green)" id="ra">—</div><div class="sl">Active Rules</div></div>
+    <div class="sc"><div class="sn" style="color:var(--blue)" id="rv">—</div><div class="sl">Validated</div></div>
+    <div class="sc"><div class="sn" style="color:var(--yellow)" id="rt">—</div><div class="sl">Total Signals</div></div>
+    <div class="sc"><div class="sn" style="color:var(--purple)" id="rp">—</div><div class="sl">Dummy Profit</div></div>
+  </div>
+  <div id="rules-list"><div class="empty"><div style="font-size:42px">📋</div><div>Loading...</div></div></div>
+</div>
+
+<div class="page" id="p-analytics">
+  <div class="ph"><div><div class="pt">📊 Analytics</div><div class="ps">Pattern analysis & performance metrics</div></div></div>
+  <div id="analytics-content"><div class="empty"><div style="font-size:42px">📊</div><div>Loading...</div></div></div>
+</div>
+
+<div class="page" id="p-ai">
+  <div class="ph">
+    <div><div class="pt">🤖 AI Insights</div><div class="ps">Claude analyzes patterns & suggests rules</div></div>
+    <button class="abtn" onclick="runAI()" id="ai-btn">🤖 Run Analysis</button>
+  </div>
+  <div id="ai-content"><div class="empty"><div style="font-size:42px">🤖</div><div>Click Run Analysis to get insights</div></div></div>
+</div>
+
+<div class="page" id="p-debug">
+  <div class="ph">
+    <div><div class="pt">🔧 API Debug</div><div class="ps">Raw response from odds-api.io — diagnose parsing issues</div></div>
+    <button class="abtn" onclick="loadDebug()">🔄 Fetch Now</button>
+  </div>
+  <div id="debug-content"><div class="empty"><div style="font-size:42px">🔧</div><div>Click Fetch Now to inspect the API response</div></div></div>
+</div>
+
+</div>
+<script>
+let cur='live';
+const statusClass={'VALIDATED':'s-validated','PROMISING':'s-promising','TESTING':'s-testing','ACTIVE':'s-active','REJECTED':'s-rejected','DANGEROUS':'s-dangerous'};
+
+function show(p,btn){
+  document.querySelectorAll('.page').forEach(x=>x.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(x=>x.classList.remove('active'));
+  document.getElementById('p-'+p).classList.add('active');
+  if(btn) btn.classList.add('active');
+  cur=p;
+  const fn={goals:loadGoals,trades:loadTrades,obs:loadObs,rules:loadRules,analytics:loadAnalytics,ai:loadAI,debug:loadDebug};
+  if(fn[p]) fn[p]();
+}
+
+async function loadLive(){
+  try{
+    const[st,obs,ai,matches]=await Promise.all([
+      fetch('/api/stats').then(r=>r.json()),
+      fetch('/api/signals').then(r=>r.json()),
+      fetch('/api/ai_live').then(r=>r.json()),
+      fetch('/api/matches').then(r=>r.json())
+    ]);
+    document.getElementById('sl').textContent=st.live||0;
+    document.getElementById('sh').textContent=st.signals||0;
+    document.getElementById('sg').textContent=st.goals_today||0;
+    document.getElementById('st').textContent=st.open_trades||0;
+    document.getElementById('upd').textContent='Updated: '+new Date().toLocaleTimeString();
+    const aiMap={};ai.forEach(a=>aiMap[a.match_id]=a.analysis);
+    const el=document.getElementById('live-cards');
+    if(!obs.length){
+      el.innerHTML='<div class="empty"><div style="font-size:36px">✅</div><div>No active signals yet</div></div>';
+    } else {
+      const bm={};
+      obs.forEach(o=>{if(!bm[o.match_id]) bm[o.match_id]={...o,signals:[]};bm[o.match_id].signals.push(o);});
+      el.innerHTML=Object.values(bm).map(m=>{
+        const ai=aiMap[m.match_id]?`<div style="background:rgba(59,130,246,0.06);border:1px solid rgba(59,130,246,0.2);border-radius:8px;padding:10px;margin-top:8px;font-size:13px;line-height:1.6;color:#94a3b8"><div style="font-size:10px;letter-spacing:2px;color:var(--blue);margin-bottom:4px">🤖 CLAUDE AI</div>${aiMap[m.match_id]}</div>`:'';
+        const sigs=m.signals.map(s=>`<div class="rec-box">
+          <div class="rec-title">🎯 ${s.action_type} · ${s.rule_name}</div>
+          <div class="rec-row">
+            <span>Market: <span class="rec-val">${s.market_type} ${s.line}</span></span>
+            <span>Side: <span class="rec-val">${(s.selected_side||'').toUpperCase()}</span></span>
+            <span>Odd: <span class="rec-val" style="color:var(--yellow)">${s.entry_odd||'—'}</span></span>
+            <span>Gap: <span class="rec-val" style="color:${(s.gap||0)>0?'var(--green)':'var(--red)'}">${s.gap||0}</span></span>
+            <span>Pressure: <span class="rec-val">${s.pressure||0}%</span></span>
+            <span style="color:var(--green)">📈 Paper Trade Created</span>
+          </div>
+        </div>`).join('');
+        return `<div class="card hot">
+          <div class="ctop">
+            <div><div class="mn">${m.home_team} vs ${m.away_team}</div><div class="ml">${m.league||''}</div></div>
+            <div class="bgs">
+              ${m.minute>0?`<span class="bg bgb">⏱ ${m.minute}'</span>`:''}
+              ${m.score&&m.score!='0-0'?`<span class="bg bgy">${m.score}</span>`:''}
+              <span class="bg bgg">🎯 SIGNAL</span>
+            </div>
+          </div>${sigs}${ai}</div>`;
+      }).join('');
+    }
+    // Show all matches
+    const mel=document.getElementById('all-matches');
+    if(!matches.length){
+      mel.innerHTML='<div style="color:var(--muted);font-size:12px;padding:10px">No matches in DB yet — waiting for first collection cycle</div>';
+    } else {
+      mel.innerHTML='<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:8px">'+
+        matches.map(m=>`<div class="card" style="padding:12px">
+          <div style="font-size:13px;font-weight:700;margin-bottom:4px">${m.home_team} vs ${m.away_team}</div>
+          <div style="font-size:10px;color:var(--muted);margin-bottom:6px">${m.league||'Unknown League'}</div>
+          <div class="bgs">
+            <span class="bg bgb">⏱ ${m.minute}'</span>
+            <span class="bg bgy">${m.score_home}-${m.score_away}</span>
+            <span class="bg ${m.period==='H1'?'bgb':m.period==='H2'?'bgp':'bgg'}">${m.period}</span>
+          </div>
+        </div>`).join('')+'</div>';
+    }
+  }catch(e){console.error(e);}
+}
+
+async function loadGoals(){
+  const goals=await fetch('/api/goals').then(r=>r.json()).catch(()=>[]);
+  const el=document.getElementById('goals-list');
+  if(!goals.length){el.innerHTML='<div class="empty"><div style="font-size:42px">⚽</div><div>No goals yet</div></div>';return;}
+  el.innerHTML=goals.map(g=>{
+    const snap=g.odds_30s||{};
+    const getOdd=k=>Object.entries(snap).find(([key])=>key.includes(k))?.[1]?.over?.toFixed(2)||'—';
+    return `<div class="card win">
+      <div class="ctop">
+        <div><div class="mn">${g.home_team||''} vs ${g.away_team||''}</div><div class="ml">${g.league||''} · ${g.period||'FT'}</div></div>
+        <div style="font-size:16px;font-weight:700;font-family:'JetBrains Mono',monospace;color:var(--green)">⚽ Min ${g.minute}</div>
+      </div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:6px">${g.score_before||'?'} → ${g.score_after||'?'} ${g.had_snapshots?'✅ has odds data':'⚠️ no odds yet'}</div>
+      <div class="stit" style="margin-bottom:8px">Over odds before goal</div>
+      <div class="otg">
+        <div class="otc"><div class="ol">30s before</div><div class="ov" style="color:var(--green)">${getOdd('FT')}</div></div>
+        <div class="otc"><div class="ol">60s before</div><div class="ov" style="color:var(--green)">${getOdd('H1')}</div></div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function loadTrades(){
+  const trades=await fetch('/api/trades').then(r=>r.json()).catch(()=>[]);
+  const el=document.getElementById('trades-content');
+  const pend=trades.filter(t=>t.result==='pending');
+  const wins=trades.filter(t=>t.result==='win');
+  const lose=trades.filter(t=>t.result==='lose');
+  const total=wins.length+lose.length;
+  const pct=total>0?Math.round(wins.length/total*100):0;
+  const profit=trades.reduce((s,t)=>s+(t.dummy_profit_loss||0),0);
+  el.innerHTML=`
+    <div class="sr">
+      <div class="sc"><div class="sn" style="color:var(--yellow)">${pend.length}</div><div class="sl">⏳ Pending</div></div>
+      <div class="sc"><div class="sn" style="color:var(--green)">${wins.length}</div><div class="sl">✅ Win</div></div>
+      <div class="sc"><div class="sn" style="color:var(--red)">${lose.length}</div><div class="sl">❌ Lose</div></div>
+      <div class="sc"><div class="sn" style="color:${profit>=0?'var(--green)':'var(--red)'}">${pct}% · €${profit.toFixed(0)}</div><div class="sl">Hit Rate · P&L</div></div>
+    </div>
+    <div class="stit">All Trades (${trades.length})</div>
+    ${!trades.length?'<div class="empty"><div style="font-size:42px">📈</div><div>No trades yet</div></div>':
+      trades.map(t=>{
+        const rc=t.result==='pending'?'bgy':t.result==='win'?'bgg':'bgr';
+        const rl=t.result==='pending'?'⏳ PENDING':t.result==='win'?'✅ WIN':'❌ LOSE';
+        const bc=t.result==='pending'?'var(--yellow)':t.result==='win'?'var(--green)':'var(--red)';
+        return `<div class="card" style="border-color:${bc}33">
+          <div class="ctop">
+            <div><div class="mn">${t.home_team} vs ${t.away_team}</div>
+            <div class="ml">${t.rule_name} · ${t.market_type} ${t.line} ${t.selected_side?.toUpperCase()}</div></div>
+            <div class="bgs">
+              ${t.minute_entry>0?`<span class="bg bgb">⏱ ${t.minute_entry}'</span>`:''}
+              <span class="bg ${rc}">${rl}</span>
+            </div>
+          </div>
+          <div class="or">
+            <div class="ot"><div class="ol">ENTRY ODD</div><div class="ov" style="color:var(--yellow)">${t.entry_odd||'—'}</div></div>
+            <div class="ot"><div class="ol">EXPECTED</div><div class="ov">${t.expected_odd||'—'}</div></div>
+            <div class="ot"><div class="ol">GAP</div><div class="ov" style="color:var(--blue)">${t.gap||0}</div></div>
+            <div class="ot"><div class="ol">PRESSURE</div><div class="ov">${t.pressure_score||0}%</div></div>
+            ${t.result!=='pending'?`<div class="ot"><div class="ol">P&L</div><div class="ov" style="color:${(t.dummy_profit_loss||0)>=0?'var(--green)':'var(--red)'}">€${(t.dummy_profit_loss||0).toFixed(0)}</div></div>`:''}
+          </div>
+          <div style="font-size:11px;color:var(--muted)">${t.action_type} · ${t.validation_window} window · Score: ${t.score_entry||'?'}</div>
+          ${t.failure_reason?`<div style="font-size:11px;color:var(--red);margin-top:4px">Reason: ${t.failure_reason}</div>`:''}
+        </div>`;
+      }).join('')}`;
+}
+
+async function loadObs(){
+  const obs=await fetch('/api/observations').then(r=>r.json()).catch(()=>[]);
+  const el=document.getElementById('obs-list');
+  if(!obs.length){el.innerHTML='<div class="empty"><div style="font-size:42px">🔥</div><div>No observations</div></div>';return;}
+  el.innerHTML=obs.map(o=>`
+    <div class="card">
+      <div class="ctop">
+        <div><div class="mn">${o.home_team} vs ${o.away_team}</div>
+        <div class="ml">${o.rule_name} · ${o.league||''}</div></div>
+        <div class="bgs">
+          ${o.minute>0?`<span class="bg bgb">⏱ ${o.minute}'</span>`:''}
+          <span class="bg bgy">${o.market_type} ${o.line}</span>
+          <span class="bg bgp">${o.action_type}</span>
+        </div>
+      </div>
+      <div class="or">
+        <div class="ot"><div class="ol">OVER</div><div class="ov">${o.over_odd||'—'}</div></div>
+        <div class="ot"><div class="ol">EXPECTED</div><div class="ov">${o.expected_odd||'—'}</div></div>
+        <div class="ot"><div class="ol">GAP</div><div class="ov" style="color:var(--blue)">${o.gap||0}</div></div>
+        <div class="ot"><div class="ol">PRESSURE</div><div class="ov">${o.pressure_score||0}%</div></div>
+        <div class="ot"><div class="ol">CONF</div><div class="ov">${o.confidence_estimate||50}%</div></div>
+      </div>
+      <div style="font-size:12px;color:var(--muted)">${o.reason||''}</div>
+    </div>`).join('');
+}
+
+async function loadRules(){
+  const rules=await fetch('/api/rules').then(r=>r.json()).catch(()=>[]);
+  const el=document.getElementById('rules-list');
+  document.getElementById('ra').textContent=rules.filter(r=>r.is_active).length;
+  document.getElementById('rv').textContent=rules.filter(r=>r.status==='VALIDATED').length;
+  document.getElementById('rt').textContent=rules.reduce((s,r)=>s+(r.total_signals||0),0);
+  const prof=rules.reduce((s,r)=>s+(r.dummy_profit||0),0);
+  document.getElementById('rp').textContent=(prof>=0?'+':'')+'€'+prof.toFixed(0);
+  if(!rules.length){el.innerHTML='<div class="empty">No rules</div>';return;}
+  el.innerHTML=rules.map(r=>{
+    const wr=parseFloat(r.win_rate||0);
+    const wc=wr>=60?'var(--green)':wr>=45?'var(--yellow)':'var(--red)';
+    const resolved=(r.win_count||0)+(r.lose_count||0);
+    const pending=(r.total_signals||0)-resolved;
+    const prof=r.dummy_profit||0;
+    const sideLabel=r.selected_side==='under'?'⬇ UNDER':'⬆ OVER';
+    const sideColor=r.selected_side==='under'?'var(--purple)':'var(--green)';
+    // Conditions summary
+    const oddRange=r.selected_side==='under'
+      ?`Under ${r.under_odd_min||'?'}–${r.under_odd_max||'?'}`
+      :`Over ${r.over_odd_min||'?'}–${r.over_odd_max||'?'}`;
+    return `<div class="card" style="border-color:${r.is_active?'var(--border2)':'var(--border)'}">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;gap:8px">
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;flex-wrap:wrap">
+            <span style="font-size:14px;font-weight:700;color:${r.is_active?'var(--text)':'var(--muted)'}">${r.source==='ai'?'🤖 ':'📋 '}${r.rule_name}</span>
+            <span class="status-badge ${statusClass[r.status]||'s-active'}">${r.status}</span>
+            <span style="font-size:11px;font-weight:700;color:${sideColor};font-family:'JetBrains Mono',monospace">${sideLabel}</span>
+          </div>
+          <div style="font-size:11px;color:var(--muted);margin-bottom:6px">${r.description||''}</div>
+          <div style="font-size:10px;color:var(--muted);font-family:'JetBrains Mono',monospace;display:flex;gap:12px;flex-wrap:wrap">
+            <span>📅 min ${r.minute_min}–${r.minute_max}</span>
+            <span>📊 ${r.market_type} ${r.line_min}–${r.line_max}</span>
+            <span>💰 ${oddRange}</span>
+            <span>⏱ window: ${r.validation_window}</span>
+            <span>🎯 ${r.action_type}</span>
+          </div>
+        </div>
+        <button class="toggle ${r.is_active?'ton':'toff'}" onclick="toggleRule('${r.rule_name}',${!r.is_active})">${r.is_active?'ON':'OFF'}</button>
+      </div>
+      <div style="background:var(--bg2);border-radius:8px;padding:10px;margin-top:8px">
+        <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;text-align:center;margin-bottom:8px">
+          <div><div style="font-size:18px;font-weight:900;font-family:'JetBrains Mono',monospace;color:var(--blue)">${r.total_signals||0}</div><div style="font-size:10px;color:var(--muted)">SIGNALS</div></div>
+          <div><div style="font-size:18px;font-weight:900;font-family:'JetBrains Mono',monospace;color:var(--green)">${r.win_count||0}</div><div style="font-size:10px;color:var(--muted)">WON</div></div>
+          <div><div style="font-size:18px;font-weight:900;font-family:'JetBrains Mono',monospace;color:var(--red)">${r.lose_count||0}</div><div style="font-size:10px;color:var(--muted)">LOST</div></div>
+          <div><div style="font-size:18px;font-weight:900;font-family:'JetBrains Mono',monospace;color:var(--yellow)">${pending}</div><div style="font-size:10px;color:var(--muted)">PENDING</div></div>
+          <div><div style="font-size:18px;font-weight:900;font-family:'JetBrains Mono',monospace;color:${prof>=0?'var(--green)':'var(--red)'}">${prof>=0?'+':''}€${prof.toFixed(0)}</div><div style="font-size:10px;color:var(--muted)">P&L</div></div>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px">
+          <div style="flex:1"><div class="pb6"><div class="pf6" style="width:${Math.min(100,wr)}%;background:${wc}"></div></div></div>
+          <span style="font-size:13px;font-family:'JetBrains Mono',monospace;font-weight:700;color:${wc};width:44px;text-align:right">${wr.toFixed(1)}%</span>
+          <span style="font-size:10px;color:var(--muted)">${resolved} resolved</span>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function toggleRule(name,state){
+  try{await fetch('/api/rules/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rule_name:name,is_active:state})});loadRules();}catch(e){console.error(e);}
+}
+
+async function runAIRules(){
+  const btn=document.getElementById('ai-rules-btn');
+  btn.disabled=true;btn.textContent='🤖 Analyzing...';
+  try{
+    const r=await fetch('/api/ai_rules',{method:'POST'});
+    const d=await r.json();
+    if(d.error)alert('Error: '+d.error);
+    else{alert(`AI done! ${d.new_rules||0} new rule suggestions added.`);loadRules();}
+  }catch(e){alert('Error');}
+  btn.disabled=false;btn.textContent='🤖 AI: Improve Rules';
+}
+
+async function loadAnalytics(){
+  const data=await fetch('/api/analytics').then(r=>r.json()).catch(()=>({}));
+  const el=document.getElementById('analytics-content');
+  const targets=[
+    {l:"Goals collected",v:data.total_goals,t:500,c:"var(--green)"},
+    {l:"Snapshots saved",v:data.total_snapshots,t:50000,c:"var(--blue)"},
+    {l:"Paper trades",v:data.total_trades,t:200,c:"var(--purple)"},
+    {l:"Observations",v:data.total_obs,t:1000,c:"var(--yellow)"}
+  ];
+  el.innerHTML=`
+    <div class="sr">
+      <div class="sc"><div class="sn" style="color:var(--green)">${data.total_goals||0}</div><div class="sl">Goals</div></div>
+      <div class="sc"><div class="sn" style="color:var(--blue)">${(data.total_snapshots||0).toLocaleString()}</div><div class="sl">Snapshots</div></div>
+      <div class="sc"><div class="sn" style="color:var(--yellow)">${data.total_obs||0}</div><div class="sl">Observations</div></div>
+      <div class="sc"><div class="sn" style="color:${(data.success_rate||0)>=55?'var(--green)':'var(--red)'}">${data.success_rate||0}%</div><div class="sl">Hit Rate</div></div>
+    </div>
+    <div class="tc">
+      <div class="card">
+        <div class="stit">Collection Progress</div>
+        ${targets.map(t=>`
+          <div style="display:flex;justify-content:space-between;margin-top:12px;font-size:12px">
+            <span style="color:var(--muted)">${t.l}</span>
+            <span style="color:${t.c};font-family:'JetBrains Mono',monospace">${t.v||0} / ${t.t}</span>
+          </div>
+          <div class="pb6"><div class="pf6" style="width:${Math.min(100,(t.v||0)/t.t*100)}%;background:${t.c}"></div></div>
+        `).join('')}
+      </div>
+      <div class="card">
+        <div class="stit">Top Rules by Signals</div>
+        ${(data.top_rules||[]).map(r=>`
+          <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);font-size:13px">
+            <span style="color:var(--muted)">${r.rule_name}</span>
+            <span style="color:var(--blue);font-family:'JetBrains Mono',monospace">${r.cnt} signals</span>
+          </div>`).join('')}
+      </div>
+    </div>`;
+}
+
+async function loadAI(){
+  const ins=await fetch('/api/insights').then(r=>r.json()).catch(()=>[]);
+  const el=document.getElementById('ai-content');
+  if(!ins.length){el.innerHTML='<div class="empty"><div style="font-size:42px">🤖</div><div>Click Run Analysis to get insights</div></div>';return;}
+  el.innerHTML=ins.map(i=>`<div class="card">
+    <div style="font-size:13px;font-weight:700;color:var(--purple);margin-bottom:4px">🧠 Market Analysis</div>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:10px;font-family:'JetBrains Mono',monospace">${new Date(i.created_at).toLocaleString()} · ${i.goals_analyzed||0} goals · ${i.rules_analyzed||0} rules</div>
+    <div style="font-size:13px;line-height:1.7;color:#94a3b8;white-space:pre-line">${i.content}</div>
+  </div>`).join('');
+}
+
+async function runAI(){
+  const btn=document.getElementById('ai-btn');btn.disabled=true;btn.textContent='⏳ Analyzing...';
+  try{
+    const r=await fetch('/api/run_ai',{method:'POST'});
+    const d=await r.json();
+    if(d.error)btn.textContent='❌ '+d.error;
+    else{await loadAI();btn.textContent='✅ Done';}
+  }catch(e){btn.textContent='❌ Error';}
+  setTimeout(()=>{btn.disabled=false;btn.textContent='🤖 Run Analysis';},3000);
+}
+
+async function loadDebug(){
+  const el=document.getElementById('debug-content');
+  el.innerHTML='<div class="empty">⏳ Fetching...</div>';
+  try{
+    const d=await fetch('/api/debug_odds').then(r=>r.json());
+    const mkts=(d.parsed?.markets||[]).map(m=>`
+      <div style="background:var(--bg2);border-radius:6px;padding:8px 12px;margin:4px 0;font-family:'JetBrains Mono',monospace;font-size:12px;display:flex;gap:16px;flex-wrap:wrap">
+        <span style="color:var(--blue)">${m.market_type}</span>
+        <span>Line: <b>${m.line}</b></span>
+        <span style="color:var(--green)">Over: ${m.over_odd||'—'}</span>
+        <span style="color:var(--red)">Under: ${m.under_odd||'—'}</span>
+      </div>`).join('');
+    el.innerHTML=`
+      <div class="card">
+        <div class="stit">Parsed Markets (${d.markets_found||0} found) — ${d.total_events||0} live events</div>
+        ${d.markets_found>0?mkts:'<div style="color:var(--red);padding:12px">⚠️ NO MARKETS PARSED — check raw JSON below</div>'}
+      </div>
+      <div class="card" style="margin-top:10px">
+        <div class="stit">Raw Odds Response</div>
+        <pre style="font-size:10px;color:var(--muted);overflow:auto;max-height:300px;white-space:pre-wrap;font-family:monospace">${JSON.stringify(d.odds_raw,null,2)}</pre>
+      </div>
+      <div class="card" style="margin-top:10px">
+        <div class="stit">Raw Event</div>
+        <pre style="font-size:10px;color:var(--muted);overflow:auto;max-height:200px;white-space:pre-wrap;font-family:monospace">${JSON.stringify(d.event_raw,null,2)}</pre>
+      </div>`;
+  }catch(e){el.innerHTML=`<div class="empty">Error: ${e.message}</div>`;}
+}
+
+async function auto(){if(cur==='live') await loadLive();}
+loadLive();setInterval(auto,20000);
+</script></body></html>"""
+
+@app.route("/")
+def index(): return render_template_string(HTML)
+
+@app.route("/health")
+def health(): return jsonify({"status":"ok","version":"v7"})
+
+@app.route("/api/matches")
+def api_matches():
+    try:
+        conn = get_db()
+        try:
+            rows = conn.run("""SELECT mid,home,away,league,minute,score_home,score_away,total_goals,period,updated_at
+                FROM matches WHERE updated_at>NOW()-INTERVAL '10 minutes'
+                ORDER BY updated_at DESC LIMIT 100""")
+            return jsonify([{"mid":r[0],"home":r[1],"away":r[2],"league":r[3],"minute":r[4],
+                "score_home":r[5],"score_away":r[6],"total_goals":r[7],"period":r[8],"updated_at":str(r[9])} for r in rows])
+        finally: conn.close()
+    except Exception as e: log.error(f"api_matches: {e}"); return jsonify([])
+
+@app.route("/api/stats")
+def api_stats():
+    try:
+        conn = get_db()
+        try:
+            live  = conn.run("SELECT COUNT(*) FROM matches WHERE updated_at>NOW()-INTERVAL '3 minutes'")[0][0]
+            sigs  = conn.run("SELECT COUNT(*) FROM observations WHERE detected_at>NOW()-INTERVAL '30 minutes'")[0][0]
+            goals = conn.run("SELECT COUNT(*) FROM goals WHERE goal_time>NOW()-INTERVAL '24 hours'")[0][0]
+            open_ = conn.run("SELECT COUNT(*) FROM trades WHERE result='pending'")[0][0]
+            return jsonify({"live":live,"signals":sigs,"goals_today":goals,"open_trades":open_})
+        finally: conn.close()
+    except: return jsonify({"live":0,"signals":0,"goals_today":0,"open_trades":0})
+
+@app.route("/api/signals")
+def api_signals():
+    try:
+        conn = get_db()
+        try:
+            rows = conn.run("""SELECT DISTINCT ON (mid,rule_id) mid,home,away,league,rule_name,minute,score,
+                mtype,line,over_odd,under_odd,expected_odd,gap,pressure,confidence,action_type,selected_side,entry_odd
+                FROM observations WHERE detected_at>NOW()-INTERVAL '30 minutes'
+                ORDER BY mid,rule_id,detected_at DESC LIMIT 50""")
+            cols=["mid","home","away","league","rule_name","minute","score","mtype","line",
+                  "over_odd","under_odd","expected_odd","gap","pressure","confidence","action_type","side","entry_odd"]
+            return jsonify([dict(zip(cols,r)) for r in rows])
+        finally: conn.close()
+    except: return jsonify([])
+
+@app.route("/api/goals")
+def api_goals():
+    try:
+        conn = get_db()
+        try:
+            rows = conn.run("SELECT mid,minute,score_before,score_after,period,home,away,league,goal_time FROM goals ORDER BY goal_time DESC LIMIT 50")
+            return jsonify([{"mid":r[0],"minute":r[1],"score_before":r[2],"score_after":r[3],
+                "period":r[4],"home":r[5],"away":r[6],"league":r[7],"goal_time":str(r[8])} for r in rows])
+        finally: conn.close()
+    except: return jsonify([])
+
+@app.route("/api/trades")
+def api_trades():
+    try:
+        conn = get_db()
+        try:
+            rows = conn.run("""SELECT home,away,league,rule_name,mtype,line,side,action_type,
+                entry_odd,expected_odd,gap,pressure,validation_window,result,profit,fail_reason,
+                created_at,entry_min,score_entry FROM trades ORDER BY created_at DESC LIMIT 100""")
+            cols=["home","away","league","rule_name","mtype","line","side","action_type",
+                  "entry_odd","expected_odd","gap","pressure","val_window","result","profit",
+                  "fail_reason","created_at","minute_entry","score_entry"]
+            result=[dict(zip(cols,r)) for r in rows]
+            for r in result: r["created_at"]=str(r["created_at"])
+            return jsonify(result)
+        finally: conn.close()
+    except: return jsonify([])
+
+@app.route("/api/observations")
+def api_observations():
+    try:
+        conn = get_db()
+        try:
+            rows = conn.run("""SELECT mid,home,away,league,rule_name,minute,score,mtype,line,
+                over_odd,under_odd,expected_odd,gap,pressure,confidence,action_type,reason,detected_at
+                FROM observations WHERE detected_at>NOW()-INTERVAL '3 hours'
+                ORDER BY detected_at DESC LIMIT 100""")
+            cols=["mid","home","away","league","rule_name","minute","score","mtype","line",
+                  "over_odd","under_odd","expected_odd","gap","pressure","confidence","action_type","reason","detected_at"]
+            result=[dict(zip(cols,r)) for r in rows]
+            for r in result: r["detected_at"]=str(r["detected_at"])
+            return jsonify(result)
+        finally: conn.close()
+    except: return jsonify([])
+
+@app.route("/api/rules")
+def api_rules():
+    try:
+        conn = get_db()
+        try:
+            rows = conn.run("""SELECT id,rule_name,description,source,mtype,line_min,line_max,min_min,min_max,
+                over_min,over_max,under_min,under_max,action_type,side,val_window,status,is_active,
+                total_signals,wins,losses,win_rate,profit,created_at FROM rules ORDER BY total_signals DESC""")
+            cols=["id","rule_name","description","source","mtype","line_min","line_max","min_min","min_max",
+                  "over_min","over_max","under_min","under_max","action_type","side","val_window","status","is_active",
+                  "total_signals","wins","losses","win_rate","profit","created_at"]
+            result=[dict(zip(cols,r)) for r in rows]
+            for r in result: r["created_at"]=str(r["created_at"])
+            return jsonify(result)
+        finally: conn.close()
+    except: return jsonify([])
+
+@app.route("/api/rules/toggle", methods=["POST"])
+def api_rules_toggle():
+    try:
+        data=request.json; conn=get_db()
+        try:
+            conn.run("UPDATE rules SET is_active=:a,updated_at=NOW() WHERE id=:b",a=data["is_active"],b=data["id"])
+            return jsonify({"status":"ok"})
+        finally: conn.close()
+    except Exception as e: return jsonify({"error":str(e)}),500
+
+@app.route("/api/analytics")
+def api_analytics():
+    try:
+        conn=get_db()
+        try:
+            goals=conn.run("SELECT COUNT(*) FROM goals")[0][0]
+            trades=conn.run("SELECT COUNT(*) FROM trades")[0][0]
+            obs=conn.run("SELECT COUNT(*) FROM observations")[0][0]
+            wins=conn.run("SELECT COUNT(*) FROM trades WHERE result='win'")[0][0]
+            done=conn.run("SELECT COUNT(*) FROM trades WHERE result!='pending'")[0][0]
+            rate=round(wins/done*100) if done>0 else 0
+            top=conn.run("SELECT rule_name,COUNT(*) cnt FROM observations GROUP BY rule_name ORDER BY cnt DESC LIMIT 8")
+            return jsonify({"goals":goals,"snapshots":0,"trades":trades,"obs":obs,"hit_rate":rate,
+                           "top_rules":[{"name":r[0],"cnt":r[1]} for r in top]})
+        finally: conn.close()
+    except: return jsonify({"goals":0,"snapshots":0,"trades":0,"obs":0,"hit_rate":0})
+
+@app.route("/api/insights")
+def api_insights():
+    try:
+        conn=get_db()
+        try:
+            rows=conn.run("SELECT itype,content,goals_n,rules_n,created_at FROM insights WHERE itype='market_analysis' ORDER BY created_at DESC LIMIT 10")
+            return jsonify([{"itype":r[0],"content":r[1],"goals_n":r[2],"rules_n":r[3],"created_at":str(r[4])} for r in rows])
+        finally: conn.close()
+    except: return jsonify([])
+
+@app.route("/api/run_ai", methods=["POST"])
+def api_run_ai():
+    if not ANTHROPIC_API_KEY: return jsonify({"error":"No API key"}),400
+    try:
+        conn=get_db()
+        try:
+            goals=conn.run("SELECT minute,score_before,period FROM goals ORDER BY goal_time DESC LIMIT 200")
+            rules=conn.run("SELECT rule_name,status,total_signals,win_rate,profit FROM rules ORDER BY total_signals DESC")
+            trades=conn.run("SELECT result,COUNT(*) FROM trades WHERE result!='pending' GROUP BY result")
+            prompt=f"""PapaGoal AI analysis. {len(goals)} goals. Trades: {[(r[0],r[1]) for r in trades]}.
+Goals: {[(g[0],g[1],g[2]) for g in goals[:20]]}. Rules: {[(r[0],r[1],r[2]) for r in rules]}.
+1) Which lines/minutes show edge? 2) Which rules work? 3) New rule recommendation? Say insufficient data if <20 cases."""
+            resp=requests.post("https://api.anthropic.com/v1/messages",
+                headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"},
+                json={"model":"claude-sonnet-4-20250514","max_tokens":1200,"messages":[{"role":"user","content":prompt}]},timeout=30)
+            if resp.status_code==200:
+                text=resp.json()["content"][0]["text"]
+                conn.run("INSERT INTO insights (itype,content,goals_n,rules_n) VALUES ('market_analysis',:a,:b,:c)",a=text,b=len(goals),c=len(rules))
+                return jsonify({"status":"ok"})
+            return jsonify({"error":f"Claude {resp.status_code}"}),500
+        finally: conn.close()
+    except Exception as e: return jsonify({"error":str(e)}),500
+
+@app.route("/api/ai_rules", methods=["POST"])
+def api_ai_rules():
+    if not ANTHROPIC_API_KEY: return jsonify({"error":"No API key"}),400
+    try:
+        conn=get_db()
+        try:
+            goals=conn.run("SELECT minute,period FROM goals ORDER BY goal_time DESC LIMIT 100")
+            rules=conn.run("SELECT rule_name,total_signals,win_rate FROM rules ORDER BY total_signals DESC")
+            prompt=f"""Suggest new PapaGoal rules. {len(goals)} goals. Rules: {[(r[0],r[1],r[2]) for r in rules]}.
+Return ONLY JSON: {{"new_rules":[{{"rule_name":"name","description":"desc","mtype":"FT","line_min":0.5,"line_max":2.5,"min_min":17,"min_max":20,"over_min":1.50,"over_max":1.60,"under_min":null,"under_max":null,"held_min":0,"action_type":"OVER_LINE_WITHIN_10M","side":"over","val_window":"10m"}}],"insights":"2 sentences"}}"""
+            resp=requests.post("https://api.anthropic.com/v1/messages",
+                headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"},
+                json={"model":"claude-sonnet-4-20250514","max_tokens":800,"messages":[{"role":"user","content":prompt}]},timeout=30)
+            if resp.status_code==200:
+                text=resp.json()["content"][0]["text"]
+                m=re.search(r'\{.*\}',text,re.DOTALL)
+                if m:
+                    data=json.loads(m.group()); count=0
+                    for nr in data.get("new_rules",[]):
+                        try:
+                            conn.run("""INSERT INTO rules (rule_name,description,source,mtype,line_min,line_max,min_min,min_max,
+                                over_min,over_max,under_min,under_max,held_min,action_type,side,val_window,status,is_active)
+                                VALUES (:a,:b,'ai',:c,:d,:e,:f,:g,:h,:i,:j,:k,:l,:m,:n,:o,'AI_HYPOTHESIS',FALSE)
+                                ON CONFLICT DO NOTHING""",
+                                a=nr["rule_name"],b=nr.get("description",""),c=nr.get("mtype","FT"),
+                                d=nr.get("line_min",0.5),e=nr.get("line_max",3.5),f=nr.get("min_min",0),g=nr.get("min_max",90),
+                                h=nr.get("over_min"),i=nr.get("over_max"),j=nr.get("under_min"),k=nr.get("under_max"),
+                                l=nr.get("held_min",0),m=nr.get("action_type","OVER_LINE_WITHIN_10M"),
+                                n=nr.get("side","over"),o=nr.get("val_window","10m"))
+                            count+=1
+                        except: pass
+                    return jsonify({"status":"ok","new_rules":count})
+            return jsonify({"error":f"Claude {resp.status_code}"}),500
+        finally: conn.close()
+    except Exception as e: return jsonify({"error":str(e)}),500
+
+init_db()
+threading.Thread(target=collector_loop,daemon=True).start()
+log.info("PapaGoal v7 started")
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0",port=PORT,debug=False)

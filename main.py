@@ -776,29 +776,37 @@ async function runAI(){
 
 async function loadDebug(){
   const el=document.getElementById('debug-content');
-  el.innerHTML='<div class="empty">⏳ Fetching...</div>';
+  el.innerHTML='<div class="empty">⏳ Fetching from odds-api.io...</div>';
   try{
     const d=await fetch('/api/debug_odds').then(r=>r.json());
-    const mkts=(d.parsed?.markets||[]).map(m=>`
-      <div style="background:var(--bg2);border-radius:6px;padding:8px 12px;margin:4px 0;font-family:'JetBrains Mono',monospace;font-size:12px;display:flex;gap:16px;flex-wrap:wrap">
-        <span style="color:var(--blue)">${m.market_type}</span>
-        <span>Line: <b>${m.line}</b></span>
-        <span style="color:var(--green)">Over: ${m.over_odd||'—'}</span>
-        <span style="color:var(--red)">Under: ${m.under_odd||'—'}</span>
+    const tried=(d.tried||[]).map(t=>`
+      <div style="display:flex;gap:10px;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);font-size:12px;flex-wrap:wrap">
+        <span style="color:${t.has_totals?'var(--green)':'var(--muted)'}">${t.has_totals?'✅':'—'}</span>
+        <span style="font-weight:600">${t.home} vs ${t.away}</span>
+        <span style="color:var(--muted);font-size:10px">${t.league}</span>
+        <span style="color:var(--blue);font-family:monospace;font-size:11px">[${(t.markets||[]).join(', ')}]</span>
       </div>`).join('');
+    const ft=d.found_totals;
+    const ftHtml=ft?`
+      <div class="card" style="margin-top:10px;border-color:rgba(52,211,153,0.4)">
+        <div class="stit">✅ Found Totals — ${ft.event?.home} vs ${ft.event?.away}</div>
+        ${(ft.all_markets||[]).filter(m=>m.name.includes('Total')).map(m=>`
+          <div style="margin:6px 0">
+            <div style="font-size:11px;color:var(--blue);margin-bottom:4px">${m.name}</div>
+            ${(m.odds||[]).map(o=>`
+              <div style="font-size:11px;font-family:monospace;color:var(--muted)">
+                Line <b style="color:var(--text)">${o.hdp}</b> — 
+                Over <b style="color:var(--green)">${o.over}</b> / 
+                Under <b style="color:var(--red)">${o.under}</b>
+              </div>`).join('')}
+          </div>`).join('')}
+      </div>`:'<div style="color:var(--red);padding:10px">No Totals found in current events</div>';
     el.innerHTML=`
       <div class="card">
-        <div class="stit">Parsed Markets (${d.markets_found||0} found) — ${d.total_events||0} live events</div>
-        ${d.markets_found>0?mkts:'<div style="color:var(--red);padding:12px">⚠️ NO MARKETS PARSED — check raw JSON below</div>'}
+        <div class="stit">${d.events_count||0} Live Events Scanned — API Key: ${d.api_key_set?'✅':'❌'}</div>
+        ${tried}
       </div>
-      <div class="card" style="margin-top:10px">
-        <div class="stit">Raw Odds Response</div>
-        <pre style="font-size:10px;color:var(--muted);overflow:auto;max-height:300px;white-space:pre-wrap;font-family:monospace">${JSON.stringify(d.odds_raw,null,2)}</pre>
-      </div>
-      <div class="card" style="margin-top:10px">
-        <div class="stit">Raw Event</div>
-        <pre style="font-size:10px;color:var(--muted);overflow:auto;max-height:200px;white-space:pre-wrap;font-family:monospace">${JSON.stringify(d.event_raw,null,2)}</pre>
-      </div>`;
+      ${ftHtml}`;
   }catch(e){el.innerHTML=`<div class="empty">Error: ${e.message}</div>`;}
 }
 

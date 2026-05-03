@@ -1037,7 +1037,7 @@ Be honest about data limitations. Say 'insufficient data' for specific claims ne
 
             resp=requests.post("https://api.anthropic.com/v1/messages",
                 headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"},
-                json={"model":"claude-sonnet-4-20250514","max_tokens":1200,"messages":[{"role":"user","content":prompt}]},
+                json={"model":"claude-sonnet-4-5","max_tokens":1200,"messages":[{"role":"user","content":prompt}]},
                 timeout=30)
             if resp.status_code==200:
                 text=resp.json()["content"][0]["text"]
@@ -1062,7 +1062,7 @@ def api_ai_rules():
 Return ONLY JSON: {{"new_rules":[{{"rule_name":"name","description":"desc","mtype":"FT","line_min":0.5,"line_max":2.5,"min_min":17,"min_max":20,"over_min":1.50,"over_max":1.60,"under_min":null,"under_max":null,"held_min":0,"action_type":"OVER_LINE_WITHIN_10M","side":"over","val_window":"10m"}}],"insights":"2 sentences"}}"""
             resp=requests.post("https://api.anthropic.com/v1/messages",
                 headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"},
-                json={"model":"claude-sonnet-4-20250514","max_tokens":800,"messages":[{"role":"user","content":prompt}]},timeout=30)
+                json={"model":"claude-sonnet-4-5","max_tokens":800,"messages":[{"role":"user","content":prompt}]},timeout=30)
             if resp.status_code==200:
                 text=resp.json()["content"][0]["text"]
                 m=re.search(r'\{.*\}',text,re.DOTALL)

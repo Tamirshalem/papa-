@@ -911,22 +911,37 @@ def api_analytics():
 
 @app.route("/api/debug_odds")
 def api_debug_odds():
-    """Debug: fetch raw odds for first live event"""
+    """Debug: find a live event that has odds"""
     try:
         r = requests.get("https://api.odds-api.io/v3/events",
-            params={"apiKey":ODDSAPI_KEY,"sport":"football","status":"live","limit":3},
-            timeout=10)
-        events = r.json() if isinstance(r.json(), list) else r.json().get("data",[])
-        result = {"events_status": r.status_code, "events_count": len(events), "api_key_set": bool(ODDSAPI_KEY)}
-        if events:
-            eid = str(events[0].get("id",""))
-            result["first_event"] = events[0]
-            # Try to get odds
-            r2 = requests.get(f"https://api.odds-api.io/v3/events/{eid}/odds",
-                params={"apiKey":ODDSAPI_KEY}, timeout=10)
-            result["odds_status"] = r2.status_code
-            try: result["odds_raw"] = r2.json()
-            except: result["odds_text"] = r2.text[:500]
+            params={"apiKey":ODDSAPI_KEY,"sport":"football","status":"live","limit":50},
+            timeout=15)
+        raw = r.json()
+        events = raw if isinstance(raw,list) else raw.get("data",[])
+        result = {"events_status":r.status_code,"events_count":len(events),"api_key_set":bool(ODDSAPI_KEY)}
+
+        # Try each event until we find one with odds
+        found_odds = None
+        tried = []
+        for ev in events[:20]:
+            eid = str(ev.get("id",""))
+            r2 = requests.get("https://api.odds-api.io/v3/odds",
+                params={"apiKey":ODDSAPI_KEY,"eventId":eid,"bookmakers":"Bet365"},
+                timeout=8)
+            data = {}
+            try: data = r2.json()
+            except: pass
+            bk = data.get("bookmakers",{})
+            markets = bk.get("Bet365",[]) if isinstance(bk,dict) else []
+            tried.append({"eid":eid,"home":ev.get("home"),"away":ev.get("away"),
+                         "league":ev.get("league",{}).get("name","") if isinstance(ev.get("league"),dict) else "",
+                         "status":r2.status_code,"markets_count":len(markets)})
+            if markets:
+                found_odds = {"event":ev,"odds_raw":data,"markets":markets}
+                break
+
+        result["tried"] = tried[:10]
+        result["found_odds"] = found_odds
         return jsonify(result)
     except Exception as e:
         return jsonify({"error":str(e)})

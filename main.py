@@ -918,6 +918,10 @@ def api_insights():
         finally: conn.close()
     except: return jsonify([])
 
+@app.route("/api/ai_live")
+def api_ai_live():
+    return jsonify([])
+
 @app.route("/api/run_ai", methods=["POST"])
 def api_run_ai():
     if not ANTHROPIC_API_KEY: return jsonify({"error":"No API key"}),400

@@ -262,6 +262,7 @@ def collect():
 
                 # Fetch odds from Bet365
                 markets = []
+                log.info(f"🔍 Fetching odds for {p['home']} vs {p['away']} (eid:{p['eid']})")
                 try:
                     r_odds = requests.get("https://api.odds-api.io/v3/odds",
                         params={"apiKey":ODDSAPI_KEY,"eventId":p["eid"],"bookmakers":"Bet365"},

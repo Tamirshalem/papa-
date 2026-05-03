@@ -911,7 +911,7 @@ def api_analytics():
 
 @app.route("/api/debug_odds")
 def api_debug_odds():
-    """Debug: find a live event that has odds"""
+    """Debug: find a live event that has Totals (Over/Under) odds"""
     try:
         r = requests.get("https://api.odds-api.io/v3/events",
             params={"apiKey":ODDSAPI_KEY,"sport":"football","status":"live","limit":50},
@@ -920,11 +920,11 @@ def api_debug_odds():
         events = raw if isinstance(raw,list) else raw.get("data",[])
         result = {"events_status":r.status_code,"events_count":len(events),"api_key_set":bool(ODDSAPI_KEY)}
 
-        # Try each event until we find one with odds
-        found_odds = None
+        found_totals = None
         tried = []
-        for ev in events[:20]:
+        for ev in events[:30]:
             eid = str(ev.get("id",""))
+            league = ev.get("league",{}).get("name","") if isinstance(ev.get("league"),dict) else ""
             r2 = requests.get("https://api.odds-api.io/v3/odds",
                 params={"apiKey":ODDSAPI_KEY,"eventId":eid,"bookmakers":"Bet365"},
                 timeout=8)
@@ -933,15 +933,15 @@ def api_debug_odds():
             except: pass
             bk = data.get("bookmakers",{})
             markets = bk.get("Bet365",[]) if isinstance(bk,dict) else []
+            mnames = [m.get("name","") for m in markets] if markets else []
+            has_totals = any("Total" in n or "O/U" in n for n in mnames)
             tried.append({"eid":eid,"home":ev.get("home"),"away":ev.get("away"),
-                         "league":ev.get("league",{}).get("name","") if isinstance(ev.get("league"),dict) else "",
-                         "status":r2.status_code,"markets_count":len(markets)})
-            if markets:
-                found_odds = {"event":ev,"odds_raw":data,"markets":markets}
-                break
+                         "league":league,"markets":mnames,"has_totals":has_totals})
+            if has_totals and not found_totals:
+                found_totals = {"event":ev,"odds_raw":data,"all_markets":markets}
 
-        result["tried"] = tried[:10]
-        result["found_odds"] = found_odds
+        result["tried"] = tried[:15]
+        result["found_totals"] = found_totals
         return jsonify(result)
     except Exception as e:
         return jsonify({"error":str(e)})

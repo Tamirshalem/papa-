@@ -863,7 +863,7 @@ async function loadRules(){
         </div>
         <div style="display:flex;gap:6px">
           <button class="toggle ${r.is_active?'ton':'toff'}" onclick="toggleRule(${r.id},${!r.is_active})">${r.is_active?'ON':'OFF'}</button>
-          <button onclick="editRule(${JSON.stringify(r).replace(/'/g,'\'').replace(/"/g,'&quot;')})" style="padding:4px 10px;background:rgba(99,179,237,0.15);border:1px solid rgba(99,179,237,0.3);border-radius:6px;color:var(--blue);font-size:11px;cursor:pointer">✏️</button>
+          <button onclick="editRuleById(${r.id})" style="padding:4px 10px;background:rgba(99,179,237,0.15);border:1px solid rgba(99,179,237,0.3);border-radius:6px;color:var(--blue);font-size:11px;cursor:pointer">✏️</button>
         </div>
       </div>
       <div style="background:var(--bg2);border-radius:8px;padding:10px;margin-top:8px">

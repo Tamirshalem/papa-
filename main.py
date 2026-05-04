@@ -482,29 +482,29 @@ def collect():
                 markets = []
                 log.info(f"🔍 Fetching odds for {p['home']} vs {p['away']} (eid:{p['eid']})")
                 try:
-                    r_odds = requests.get("https://api.odds-api.io/v3/odds",
-                        params={"apiKey":ODDSAPI_KEY,"eventId":p["eid"],"bookmakers":"Bet365"},
-                        timeout=6)
-                    if r_odds.status_code == 200:
+                    for bk in ["Bet365","Sbobet","1xbet","Unibet","Betfair Sportsbook"]:
+                        r_odds = requests.get("https://api.odds-api.io/v3/odds",
+                            params={"apiKey":ODDSAPI_KEY,"eventId":p["eid"],"bookmakers":bk},
+                            timeout=5)
+                        if r_odds.status_code != 200: continue
                         od = r_odds.json()
-                        bk_markets = od.get("bookmakers",{}).get("Bet365",[]) or []
+                        bk_markets = od.get("bookmakers",{}).get(bk,[]) or []
                         for mkt in bk_markets:
                             mname = mkt.get("name","")
-                            odds_list = mkt.get("odds",[])
-                            # Totals = FT Over/Under, Totals HT = H1 Over/Under
-                            if mname in ("Totals","Totals HT","Goals Over/Under"):
-                                mtype = "H1" if "HT" in mname else "FT"
-                                for o in odds_list:
-                                    line = float(o.get("hdp") or o.get("line") or 2.5)
-                                    over = float(o.get("over") or 0) or None
-                                    under = float(o.get("under") or 0) or None
-                                    if over and over > 1:
-                                        markets.append({"mtype":mtype,"line":line,"over":over,"under":under})
-                                        k = ckey(mid,mtype,str(line))
-                                        if k not in opening_cache:
-                                            opening_cache[k] = {"over":over,"under":under}
+                            if mname not in ("Totals","Totals HT","Goals Over/Under"): continue
+                            mtype = "H1" if "HT" in mname else "FT"
+                            for o in mkt.get("odds",[]):
+                                line = float(o.get("hdp") or o.get("line") or 2.5)
+                                over = float(o.get("over") or 0) or None
+                                under = float(o.get("under") or 0) or None
+                                if over and over > 1:
+                                    markets.append({"mtype":mtype,"line":line,"over":over,"under":under})
+                                    k = ckey(mid,mtype,str(line))
+                                    if k not in opening_cache:
+                                        opening_cache[k] = {"over":over,"under":under}
                         if markets:
-                            log.info(f"📊 Odds: {p['home']} vs {p['away']} — {len(markets)} markets")
+                            log.info(f"📊 Odds: {p['home']} vs {p['away']} — {len(markets)} markets [{bk}]")
+                            break
                 except Exception as oe:
                     log.warning(f"📊 Odds error: {oe}")
 

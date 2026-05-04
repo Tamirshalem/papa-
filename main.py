@@ -936,7 +936,13 @@ def api_signals():
                 ORDER BY mid,rule_id,detected_at DESC LIMIT 50""")
             cols=["mid","home","away","league","rule_name","minute","score","mtype","line",
                   "over_odd","under_odd","expected_odd","gap","pressure","confidence","action_type","side","entry_odd"]
-            return jsonify([dict(zip(cols,r)) for r in rows])
+            result=[dict(zip(cols,r)) for r in rows]
+            for r in result:
+                r["home_team"]=r["home"]
+                r["away_team"]=r["away"]
+                r["selected_side"]=r["side"]
+                r["market_type"]=r["mtype"]
+            return jsonify(result)
         finally: conn.close()
     except: return jsonify([])
 
@@ -963,7 +969,11 @@ def api_trades():
                   "entry_odd","expected_odd","gap","pressure","val_window","result","profit",
                   "fail_reason","created_at","minute_entry","score_entry"]
             result=[dict(zip(cols,r)) for r in rows]
-            for r in result: r["created_at"]=str(r["created_at"])
+            for r in result:
+                r["created_at"]=str(r["created_at"])
+                r["home_team"]=r["home"]
+                r["away_team"]=r["away"]
+                r["validation_window"]=r["val_window"]
             return jsonify(result)
         finally: conn.close()
     except: return jsonify([])

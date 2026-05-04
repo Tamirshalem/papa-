@@ -1203,9 +1203,18 @@ Return ONLY JSON: {json_example}"""
                 json={"model":"claude-sonnet-4-5","max_tokens":800,"messages":[{"role":"user","content":prompt}]},timeout=30)
             if resp.status_code==200:
                 text=resp.json()["content"][0]["text"]
+                # Clean markdown code blocks
+                text=re.sub(r'```json\s*','',text)
+                text=re.sub(r'```\s*','',text)
                 m=re.search(r'\{.*\}',text,re.DOTALL)
                 if m:
-                    data=json.loads(m.group()); count=0
+                    try:
+                        data=json.loads(m.group())
+                    except:
+                        # Try to find just the new_rules array
+                        m2=re.search(r'"new_rules"\s*:\s*(\[.*?\])',text,re.DOTALL)
+                        data={"new_rules":json.loads(m2.group(1))} if m2 else {"new_rules":[]}
+                    count=0
                     for nr in data.get("new_rules",[]):
                         try:
                             conn.run("""INSERT INTO rules (rule_name,description,source,mtype,line_min,line_max,min_min,min_max,

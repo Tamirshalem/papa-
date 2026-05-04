@@ -116,7 +116,8 @@ def init_db():
         if conn.run("SELECT COUNT(*) FROM rules")[0][0] == 0:
             _seed_rules(conn)
         conn.run("UPDATE rules SET mtype='H1',action_type='H1_OVER_LINE_BEFORE_HT',val_window='HT',description='Over H1 1.50-1.57 at min 17-20 — goal before HT' WHERE rule_name='Early Drop Signal' AND mtype='FT'")
-        conn.run("UPDATE rules SET val_window='5m' WHERE rule_name='Late FT Goal Hold' AND val_window='FT'")
+        conn.run("UPDATE rules SET over_min=2.70,description='FT Over >=2.70 after min 82 — hold Under' WHERE rule_name='Market Shut'")
+        conn.run("UPDATE rules SET over_min=2.00,over_max=2.65,min_min=85,min_max=95,description='FT Over 2.00-2.65 at min 85+ — market expects goal' WHERE rule_name='Late FT Goal Hold'")
         conn.run("UPDATE rules SET side='under' WHERE rule_name='Market Shut' AND side='over'")
         # Sync rules stats from existing resolved trades
         conn.run("""UPDATE rules r SET
@@ -136,11 +137,11 @@ def init_db():
 
 def _seed_rules(conn):
     rules = [
-        ("Market Shut","Over FT >=2.80 after min 82","FT",1.5,5.5,82,95,2.80,99.0,None,None,0,"UNDER_HOLDS_10M","under","10m","VALIDATED"),
+        ("Market Shut","FT Over >=2.70 after min 82 — hold Under","FT",1.5,5.5,82,95,2.70,99.0,None,None,0,"UNDER_HOLDS_10M","under","10m","VALIDATED"),
         ("Early Drop Signal","Over H1 1.50-1.57 at min 17-20 — goal before HT","H1",0.5,1.5,17,20,1.50,1.57,None,None,0,"H1_OVER_LINE_BEFORE_HT","over","HT","PROMISING"),
         ("H1 Minute 18 Pressure","Over H1 1.40-1.60 at min 15-22","H1",0.5,3.5,15,22,1.40,1.60,None,None,0,"H1_OVER_LINE_BEFORE_HT","over","HT","TESTING"),
         ("H1 Under 1.66","Under H1 1.60-1.72 at min 30-38","H1",0.5,3.5,30,38,None,None,1.60,1.72,0,"UNDER_HOLDS_TO_HT","under","HT","TESTING"),
-        ("Late FT Goal Hold","FT Over 2.20-2.80 at min 86+ — goal in final minutes","FT",1.5,4.5,86,95,2.20,2.80,None,None,60,"OVER_LINE_BEFORE_FT","over","5m","TESTING"),
+        ("Late FT Goal Hold","FT Over 2.00-2.65 at min 85+ — market expects goal","FT",1.5,4.5,85,95,2.00,2.65,None,None,0,"OVER_LINE_BEFORE_FT","over","5m","TESTING"),
     ]
     for r in rules:
         try:
@@ -300,7 +301,8 @@ def validate_trades(conn):
             elif elapsed>7: result,fail="lose","No goal in 5min"
         elif action == "UNDER_HOLDS_10M":
             if goals_since>0 and line_crossed: result,fail="lose","Line crossed"
-            elif elapsed>12: result="win"
+            elif cur_period=="FT": result="win" if not line_crossed else "lose"; fail="Line crossed at FT" if result=="lose" else None
+            elif elapsed>12 and not line_crossed: result="win"
         elif action in ("H1_OVER_LINE_BEFORE_HT","H1_GOAL_BEFORE_HT"):
             ht = cur_period in ("H2","FT") or (cur_period=="H1" and (cur_min or 0)>=46)
             if ht: result="win" if line_crossed else "lose"; fail="Not crossed by HT" if result=="lose" else None

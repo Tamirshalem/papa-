@@ -724,7 +724,7 @@ async function loadRules(){
   document.getElementById('ra').textContent=rules.filter(r=>r.is_active).length;
   document.getElementById('rv').textContent=rules.filter(r=>r.status==='VALIDATED').length;
   document.getElementById('rt').textContent=rules.reduce((s,r)=>s+(r.total_signals||0),0);
-  const prof=rules.reduce((s,r)=>s+(r.dummy_profit||0),0);
+  const prof=rules.reduce((s,r)=>s+(r.profit||r.dummy_profit||0),0);
   document.getElementById('rp').textContent=(prof>=0?'+':'')+'€'+prof.toFixed(0);
   if(!rules.length){el.innerHTML='<div class="empty">No rules</div>';return;}
   el.innerHTML=rules.map(r=>{
@@ -732,7 +732,7 @@ async function loadRules(){
     const wc=wr>=60?'var(--green)':wr>=45?'var(--yellow)':'var(--red)';
     const resolved=(r.win_count||0)+(r.lose_count||0);
     const pending=(r.total_signals||0)-resolved;
-    const prof=r.dummy_profit||0;
+    const prof=r.profit||r.dummy_profit||0;
     const sideLabel=r.selected_side==='under'?'⬇ UNDER':'⬆ OVER';
     const sideColor=r.selected_side==='under'?'var(--purple)':'var(--green)';
     // Conditions summary
@@ -749,20 +749,20 @@ async function loadRules(){
           </div>
           <div style="font-size:11px;color:var(--muted);margin-bottom:6px">${r.description||''}</div>
           <div style="font-size:10px;color:var(--muted);font-family:'JetBrains Mono',monospace;display:flex;gap:12px;flex-wrap:wrap">
-            <span>📅 min ${r.minute_min}–${r.minute_max}</span>
-            <span>📊 ${r.market_type} ${r.line_min}–${r.line_max}</span>
+            <span>📅 min ${r.min_min||r.minute_min||"?"}–${r.min_max||r.minute_max||"?"}</span>
+            <span>📊 ${r.mtype||r.market_type||"FT"} ${r.line_min||"?"}–${r.line_max||"?"}</span>
             <span>💰 ${oddRange}</span>
-            <span>⏱ window: ${r.validation_window}</span>
+            <span>⏱ window: ${r.val_window||r.validation_window||"?"}</span>
             <span>🎯 ${r.action_type}</span>
           </div>
         </div>
-        <button class="toggle ${r.is_active?'ton':'toff'}" onclick="toggleRule('${r.rule_name}',${!r.is_active})">${r.is_active?'ON':'OFF'}</button>
+        <button class="toggle ${r.is_active?'ton':'toff'}" onclick="toggleRule(${r.id},${!r.is_active})">${r.is_active?'ON':'OFF'}</button>
       </div>
       <div style="background:var(--bg2);border-radius:8px;padding:10px;margin-top:8px">
         <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;text-align:center;margin-bottom:8px">
           <div><div style="font-size:18px;font-weight:900;font-family:'JetBrains Mono',monospace;color:var(--blue)">${r.total_signals||0}</div><div style="font-size:10px;color:var(--muted)">SIGNALS</div></div>
-          <div><div style="font-size:18px;font-weight:900;font-family:'JetBrains Mono',monospace;color:var(--green)">${r.win_count||0}</div><div style="font-size:10px;color:var(--muted)">WON</div></div>
-          <div><div style="font-size:18px;font-weight:900;font-family:'JetBrains Mono',monospace;color:var(--red)">${r.lose_count||0}</div><div style="font-size:10px;color:var(--muted)">LOST</div></div>
+          <div><div style="font-size:18px;font-weight:900;font-family:'JetBrains Mono',monospace;color:var(--green)">${r.wins||r.win_count||0}</div><div style="font-size:10px;color:var(--muted)">WON</div></div>
+          <div><div style="font-size:18px;font-weight:900;font-family:'JetBrains Mono',monospace;color:var(--red)">${r.losses||r.lose_count||0}</div><div style="font-size:10px;color:var(--muted)">LOST</div></div>
           <div><div style="font-size:18px;font-weight:900;font-family:'JetBrains Mono',monospace;color:var(--yellow)">${pending}</div><div style="font-size:10px;color:var(--muted)">PENDING</div></div>
           <div><div style="font-size:18px;font-weight:900;font-family:'JetBrains Mono',monospace;color:${prof>=0?'var(--green)':'var(--red)'}">${prof>=0?'+':''}€${prof.toFixed(0)}</div><div style="font-size:10px;color:var(--muted)">P&L</div></div>
         </div>

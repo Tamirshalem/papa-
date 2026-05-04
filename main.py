@@ -694,7 +694,7 @@ async function loadTrades(){
             <div class="ot"><div class="ol">PRESSURE</div><div class="ov">${t.pressure||t.pressure_score||0}%</div></div>
             ${t.result!=='pending'?`<div class="ot"><div class="ol">P&L</div><div class="ov" style="color:${(t.profit||t.dummy_profit_loss||0)>=0?'var(--green)':'var(--red)'}">€${(t.profit||t.dummy_profit_loss||0).toFixed(0)}</div></div>`:''}
           </div>
-          <div style="font-size:11px;color:var(--muted)">${{'OVER_LINE_WITHIN_10M':'🎯 Goal expected within 10min','OVER_LINE_WITHIN_5M':'🎯 Goal expected within 5min','UNDER_HOLDS_10M':'🛡 No goal for 10min','H1_OVER_LINE_BEFORE_HT':'🎯 Goal before Half Time','UNDER_HOLDS_TO_HT':'🛡 No goal until Half Time','OVER_LINE_BEFORE_FT':'🎯 Goal before Full Time'}[t.action_type]||t.action_type} · Window: ${t.val_window||'10m'} · Score at entry: ${t.score_entry||'—'}</div>
+          <div style="font-size:11px;color:var(--muted)">${(()=>{const m={'OVER_LINE_WITHIN_10M':'🎯 Goal in 10min','OVER_LINE_WITHIN_5M':'🎯 Goal in 5min','UNDER_HOLDS_10M':'🛡 No goal 10min','H1_OVER_LINE_BEFORE_HT':'🎯 Goal before HT','UNDER_HOLDS_TO_HT':'🛡 No goal to HT','OVER_LINE_BEFORE_FT':'🎯 Goal before FT','OVER_LINE_WITHIN_15M':'🎯 Goal in 15min'};return m[t.action_type]||t.action_type;})()} · Window: ${t.val_window||'10m'} · Score: ${t.score_entry||'—'}</div>
           ${(t.fail_reason||t.failure_reason)?`<div style="font-size:11px;color:var(--red);margin-top:4px">${t.fail_reason||t.failure_reason}</div>`:""}
         </div>`;
       }).join('')}`;

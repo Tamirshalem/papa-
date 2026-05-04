@@ -736,9 +736,9 @@ async function loadRules(){
     const sideLabel=r.selected_side==='under'?'⬇ UNDER':'⬆ OVER';
     const sideColor=r.selected_side==='under'?'var(--purple)':'var(--green)';
     // Conditions summary
-    const oddRange=r.selected_side==='under'
-      ?`Under ${r.under_odd_min||'?'}–${r.under_odd_max||'?'}`
-      :`Over ${r.over_odd_min||'?'}–${r.over_odd_max||'?'}`;
+    const oddRange=r.side==='under'
+      ?`Under ${r.under_min||r.under_odd_min||'?'}–${r.under_max||r.under_odd_max||'?'}`
+      :`Over ${r.over_min||r.over_odd_min||'?'}–${r.over_max||r.over_odd_max||'?'}`;
     return `<div class="card" style="border-color:${r.is_active?'var(--border2)':'var(--border)'}">
       <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;gap:8px">
         <div style="flex:1">
@@ -1015,12 +1015,17 @@ def api_rules():
 @app.route("/api/rules/toggle", methods=["POST"])
 def api_rules_toggle():
     try:
-        data=request.json; conn=get_db()
+        data=request.json
+        log.info(f"Toggle: {data}")
+        conn=get_db()
         try:
-            conn.run("UPDATE rules SET is_active=:a,updated_at=NOW() WHERE id=:b",a=data["is_active"],b=data["id"])
+            conn.run("UPDATE rules SET is_active=:a WHERE id=:b",
+                a=data["is_active"],b=data["id"])
             return jsonify({"status":"ok"})
         finally: conn.close()
-    except Exception as e: return jsonify({"error":str(e)}),500
+    except Exception as e:
+        log.error(f"Toggle error: {e}")
+        return jsonify({"error":str(e)}),500
 
 @app.route("/api/analytics")
 def api_analytics():

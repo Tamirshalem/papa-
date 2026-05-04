@@ -113,6 +113,16 @@ def init_db():
         conn.run("""CREATE TABLE IF NOT EXISTS insights (
             id SERIAL PRIMARY KEY, created_at TIMESTAMPTZ DEFAULT NOW(),
             itype TEXT, content TEXT, goals_n INT DEFAULT 0, rules_n INT DEFAULT 0)""")
+        conn.run("""CREATE TABLE IF NOT EXISTS opening_odds (
+            id SERIAL PRIMARY KEY,
+            mid TEXT NOT NULL,
+            home TEXT, away TEXT, league TEXT,
+            mtype TEXT NOT NULL,
+            line NUMERIC NOT NULL,
+            over_open NUMERIC,
+            under_open NUMERIC,
+            saved_at TIMESTAMPTZ DEFAULT NOW(),
+            UNIQUE(mid, mtype, line))""")
         if conn.run("SELECT COUNT(*) FROM rules")[0][0] == 0:
             _seed_rules(conn)
         conn.run("UPDATE rules SET mtype='H1',action_type='H1_OVER_LINE_BEFORE_HT',val_window='HT',description='Over H1 1.50-1.57 at min 17-20 — goal before HT' WHERE rule_name='Early Drop Signal' AND mtype='FT'")
@@ -202,6 +212,27 @@ def parse_event(event):
             "minute":minute,"score_h":score_h,"score_a":score_a,
             "period":period,"total":score_h+score_a}
 
+def save_opening_odds(conn, mid, home, away, league, markets):
+    """Save opening odds for a match — only saves once per mid+mtype+line"""
+    for mkt in markets:
+        try:
+            conn.run("""INSERT INTO opening_odds (mid,home,away,league,mtype,line,over_open,under_open)
+                VALUES (:a,:b,:c,:d,:e,:f,:g,:h)
+                ON CONFLICT (mid,mtype,line) DO NOTHING""",
+                a=mid,b=home,c=away,d=league,
+                e=mkt["mtype"],f=mkt["line"],
+                g=mkt.get("over"),h=mkt.get("under"))
+        except Exception as e:
+            log.debug(f"Opening odds: {e}")
+
+def get_opening(conn, mid, mtype, line):
+    """Get opening odds for a specific market"""
+    try:
+        r = conn.run("SELECT over_open,under_open FROM opening_odds WHERE mid=:a AND mtype=:b AND line=:c",
+            a=mid,b=mtype,c=line)
+        return {"over":float(r[0][0]),"under":float(r[0][1])} if r else None
+    except: return None
+
 def check_rules(conn, mid, home, away, league, minute, sh, sa, period, markets, held_map):
     try:
         rules = conn.run("""SELECT id,rule_name,mtype,line_min,line_max,
@@ -245,9 +276,19 @@ def check_rules(conn, mid, home, away, league, minute, sh, sa, period, markets, 
             if held_min and held < held_min: continue
 
             exp = get_expected(mtype, str(line), minute)
-            gap = round(exp - entry_odd, 3) if exp and entry_odd else 0
-            op = opening_cache.get(hk)
-            op_side = op.get("over") if op and side=="over" else (op.get("under") if op else None)
+            # Use real opening odds from DB
+            op_db = get_opening(conn, mid, mtype, str(line))
+            op = op_db or opening_cache.get(hk)
+            op_over = float(op.get("over") or 0) if op else None
+            op_under = float(op.get("under") or 0) if op else None
+            op_side = op_over if side=="over" else op_under
+            # GAP = current odd vs opening odd (positive = moved away = market signal)
+            if op_side and entry_odd:
+                gap = round(entry_odd - op_side, 3)
+            elif exp and entry_odd:
+                gap = round(exp - entry_odd, 3)
+            else:
+                gap = 0
             pres = calc_pressure(entry_odd, op_side, exp) if op_side and exp else 0
             score_str = f"{sh}-{sa}"
             confidence = min(95, 50+pres//3+(20 if status=="VALIDATED" else 10 if status=="PROMISING" else 0))
@@ -1301,6 +1342,20 @@ def api_debug_odds():
         return jsonify(result)
     except Exception as e:
         return jsonify({"error":str(e)})
+
+@app.route("/api/opening_odds")
+def api_opening_odds():
+    """Get opening odds for all tracked matches"""
+    try:
+        conn=get_db()
+        try:
+            rows=conn.run("""SELECT mid,home,away,league,mtype,line,over_open,under_open,saved_at
+                FROM opening_odds ORDER BY saved_at DESC LIMIT 500""")
+            return jsonify([{"mid":r[0],"home":r[1],"away":r[2],"league":r[3],
+                "mtype":r[4],"line":float(r[5]),"over_open":float(r[6]) if r[6] else None,
+                "under_open":float(r[7]) if r[7] else None,"saved_at":str(r[8])} for r in rows])
+        finally: conn.close()
+    except Exception as e: return jsonify({"error":str(e)}),500
 
 @app.route("/api/insights")
 def api_insights():

@@ -717,17 +717,44 @@ async function loadLive(){
       mel.innerHTML='<div style="color:var(--muted);font-size:13px;padding:20px;text-align:center">⚽ No live matches right now — check back when European leagues are playing (afternoons)</div>';
     } else {
       mel.innerHTML='<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:8px">'+
-        matches.map(m=>`<div class="card" style="padding:12px">
-          <div style="font-size:13px;font-weight:700;margin-bottom:4px">${m.home_team} vs ${m.away_team}</div>
+        matches.map(m=>`<div class="card" style="padding:12px;cursor:pointer" onclick="toggleMatchOdds('${m.mid}',this)">
+          <div style="font-size:13px;font-weight:700;margin-bottom:4px">${m.home||m.home_team||'?'} vs ${m.away||m.away_team||'?'}</div>
           <div style="font-size:10px;color:var(--muted);margin-bottom:6px">${m.league||'Unknown League'}</div>
           <div class="bgs">
             <span class="bg bgb">⏱ ${m.minute}'</span>
             <span class="bg bgy">${m.score_home}-${m.score_away}</span>
             <span class="bg ${m.period==='H1'?'bgb':m.period==='H2'?'bgp':'bgg'}">${m.period}</span>
           </div>
+          <div class="match-odds-panel" style="display:none;margin-top:8px;border-top:1px solid var(--border);padding-top:8px">
+            <div style="font-size:10px;color:var(--muted);margin-bottom:4px">📊 Opening Odds</div>
+            <div class="odds-loading" style="font-size:11px;color:var(--muted)">Loading...</div>
+          </div>
         </div>`).join('')+'</div>';
     }
   }catch(e){console.error(e);}
+}
+
+async function toggleMatchOdds(mid, card){
+  const panel = card.querySelector('.match-odds-panel');
+  if(panel.style.display==='none'){
+    panel.style.display='block';
+    const loader = panel.querySelector('.odds-loading');
+    try{
+      const data = await fetch('/api/opening_odds?mid='+mid).then(r=>r.json());
+      if(!data.length){ loader.textContent='No opening odds yet'; return; }
+      // Group by mtype
+      const h1 = data.filter(o=>o.mtype==='H1');
+      const ft = data.filter(o=>o.mtype==='FT');
+      const row = (o) => `<div style="display:flex;justify-content:space-between;font-size:11px;padding:2px 0">
+        <span style="color:var(--muted)">${o.mtype} ${o.line}</span>
+        <span style="color:var(--green)">O: ${o.over_open||'—'}</span>
+        <span style="color:var(--red)">U: ${o.under_open||'—'}</span>
+      </div>`;
+      loader.innerHTML = [...h1,...ft].map(row).join('');
+    }catch(e){ loader.textContent='Error loading odds'; }
+  } else {
+    panel.style.display='none';
+  }
 }
 
 async function loadGoals(){
@@ -1383,15 +1410,20 @@ def api_debug_odds():
 
 @app.route("/api/opening_odds")
 def api_opening_odds():
-    """Get opening odds for all tracked matches"""
     try:
+        mid = request.args.get("mid")
         conn=get_db()
         try:
-            rows=conn.run("""SELECT mid,home,away,league,mtype,line,over_open,under_open,saved_at
-                FROM opening_odds ORDER BY saved_at DESC LIMIT 500""")
+            if mid:
+                rows=conn.run("""SELECT mid,home,away,league,mtype,line,over_open,under_open
+                    FROM opening_odds WHERE mid=:a ORDER BY mtype,line""",a=mid)
+            else:
+                rows=conn.run("""SELECT mid,home,away,league,mtype,line,over_open,under_open
+                    FROM opening_odds ORDER BY saved_at DESC LIMIT 500""")
             return jsonify([{"mid":r[0],"home":r[1],"away":r[2],"league":r[3],
-                "mtype":r[4],"line":float(r[5]),"over_open":float(r[6]) if r[6] else None,
-                "under_open":float(r[7]) if r[7] else None,"saved_at":str(r[8])} for r in rows])
+                "mtype":r[4],"line":float(r[5]),
+                "over_open":float(r[6]) if r[6] else None,
+                "under_open":float(r[7]) if r[7] else None} for r in rows])
         finally: conn.close()
     except Exception as e: return jsonify({"error":str(e)}),500
 

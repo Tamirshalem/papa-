@@ -136,6 +136,9 @@ def init_db():
                 WHERE t.result='win' AND t.side='under' 
                 AND m.total_goals > t.line
             )""")
+        try:
+            conn.run("ALTER TABLE rules ADD COLUMN IF NOT EXISTS min_gap NUMERIC DEFAULT 0")
+        except: pass
         conn.run("UPDATE rules SET over_min=2.70,description='FT Over >=2.70 after min 82 — hold Under' WHERE rule_name='Market Shut'")
         conn.run("UPDATE rules SET over_min=2.00,over_max=2.65,min_min=85,min_max=95,description='FT Over 2.00-2.65 at min 85+ — market expects goal' WHERE rule_name='Late FT Goal Hold'")
         conn.run("UPDATE rules SET side='under' WHERE rule_name='Market Shut' AND side='over'")
@@ -161,6 +164,9 @@ def _seed_rules(conn):
         ("Early Drop Signal","Over H1 1.50-1.57 at min 17-20 — goal before HT","H1",0.5,1.5,17,20,1.50,1.57,None,None,0,"H1_OVER_LINE_BEFORE_HT","over","HT","PROMISING"),
         ("H1 Minute 18 Pressure","Over H1 1.40-1.60 at min 15-22","H1",0.5,3.5,15,22,1.40,1.60,None,None,0,"H1_OVER_LINE_BEFORE_HT","over","HT","TESTING"),
         ("H1 Under 1.66","Under H1 1.60-1.72 at min 30-38","H1",0.5,3.5,30,38,None,None,1.60,1.72,0,"UNDER_HOLDS_TO_HT","under","HT","TESTING"),
+        ("H1 Opening Gap Signal","H1 Over 0.5 rose 0.50+ from opening by min 25-40 — gap opportunity","H1",0.5,1.5,25,40,1.70,3.50,None,None,0,"H1_OVER_LINE_BEFORE_HT","over","HT","TESTING"),
+        ("FT Opening Gap Signal","FT Over 0.5 rose 0.80+ from opening by min 60-80 — gap opportunity","FT",0.5,1.5,60,80,2.00,4.00,None,None,0,"OVER_LINE_BEFORE_FT","over","FT","TESTING"),
+        ("Late FT Gap Bomb","FT Over 0.5 rose 1.50+ from opening by min 75-88 — extreme gap","FT",0.5,1.5,75,88,2.80,5.00,None,None,0,"OVER_LINE_WITHIN_10M","over","10m","TESTING"),
         ("Late FT Goal Hold","FT Over 2.00-2.65 at min 85+ — market expects goal","FT",1.5,4.5,85,95,2.00,2.65,None,None,0,"OVER_LINE_BEFORE_FT","over","5m","TESTING"),
     ]
     for r in rules:
@@ -237,7 +243,7 @@ def check_rules(conn, mid, home, away, league, minute, sh, sa, period, markets, 
     try:
         rules = conn.run("""SELECT id,rule_name,mtype,line_min,line_max,
             min_min,min_max,over_min,over_max,under_min,under_max,
-            held_min,action_type,side,val_window,status
+            held_min,COALESCE(min_gap,0),action_type,side,val_window,status
             FROM rules WHERE is_active=TRUE""")
     except Exception as e:
         log.error(f"Rules fetch: {e}"); return
@@ -246,12 +252,21 @@ def check_rules(conn, mid, home, away, league, minute, sh, sa, period, markets, 
 
     for rule in rules:
         (rid,rname,mtype,lmin,lmax,mmin,mmax,
-         ovmin,ovmax,unmin,unmax,held_min,action,side,val_win,status) = rule
+         ovmin,ovmax,unmin,unmax,held_min,min_gap,action,side,val_win,status) = rule
         if mmin and minute < mmin: continue
         if mmax and minute > mmax: continue
 
         # Special condition: FT Late Comeback requires 2+ goals already
         if rname == "FT Late Comeback Signal" and total_goals < 2: continue
+
+        # Check minimum GAP from opening odds
+        if min_gap and min_gap > 0:
+            op_db = get_opening(conn, mid, mtype, str(lmin))
+            if op_db:
+                op_side_open = op_db.get("over") if side=="over" else op_db.get("under")
+                if op_side_open:
+                    # We need current odds to check gap — get from markets
+                    pass  # gap will be checked per market below
 
         for mkt in markets:
             if mkt["mtype"] != mtype: continue
@@ -270,6 +285,16 @@ def check_rules(conn, mid, home, away, league, minute, sh, sa, period, markets, 
                 if unmin and under < unmin: continue
                 if unmax and under > unmax: continue
                 entry_odd = under
+
+            # Check GAP from opening if required
+            if min_gap and min_gap > 0:
+                op_db = get_opening(conn, mid, mtype, str(line))
+                if op_db:
+                    op_s = float(op_db.get("over") or 0) if side=="over" else float(op_db.get("under") or 0)
+                    actual_gap = entry_odd - op_s if op_s else 0
+                    if actual_gap < min_gap: continue
+                else:
+                    continue  # No opening odds saved yet — skip
 
             hk = ckey(mid, mtype, str(line))
             held = held_map.get(hk, 0)
@@ -572,7 +597,7 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;min-h
     <div class="sc"><div class="sn" style="color:var(--purple)" id="st">—</div><div class="sl">Open Trades</div></div>
   </div>
   <div class="stit">🎯 Active Recommendations</div>
-  <div id="live-cards"><div class="empty"><div style="font-size:42px">📡</div><div>Scanning live matches...</div></div></div>
+  <div id="live-cards"><div class="empty"><div style="font-size:42px">⚽</div><div>No active signals — waiting for live matches</div></div></div>
   <div class="stit" style="margin-top:20px">📡 All Live Matches</div>
   <div id="all-matches"><div class="empty" style="padding:20px">Loading matches...</div></div>
 </div>
@@ -689,7 +714,7 @@ async function loadLive(){
     // Show all matches
     const mel=document.getElementById('all-matches');
     if(!matches.length){
-      mel.innerHTML='<div style="color:var(--muted);font-size:12px;padding:10px">No matches in DB yet — waiting for first collection cycle</div>';
+      mel.innerHTML='<div style="color:var(--muted);font-size:13px;padding:20px;text-align:center">⚽ No live matches right now — check back when European leagues are playing (afternoons)</div>';
     } else {
       mel.innerHTML='<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:8px">'+
         matches.map(m=>`<div class="card" style="padding:12px">
@@ -806,6 +831,7 @@ async function loadRules(){
   const prof=rules.reduce((s,r)=>s+(r.profit||r.dummy_profit||0),0);
   document.getElementById('rp').textContent=(prof>=0?'+':'')+'€'+prof.toFixed(0);
   if(!rules.length){el.innerHTML='<div class="empty">No rules</div>';return;}
+  _rulesCache=rules;
   el.innerHTML=rules.map(r=>{
     const wr=parseFloat(r.win_rate||0);
     const wc=wr>=60?'var(--green)':wr>=45?'var(--yellow)':'var(--red)';
@@ -932,6 +958,18 @@ async function runAI(){
     else{await loadAI();btn.textContent='✅ Done';}
   }catch(e){btn.textContent='❌ Error';}
   setTimeout(()=>{btn.disabled=false;btn.textContent='🤖 Run Analysis';},3000);
+}
+
+let _rulesCache = [];
+
+function editRuleById(id){
+  const r = _rulesCache.find(x=>x.id===id);
+  if(r) editRule(r);
+  else fetch('/api/rules').then(res=>res.json()).then(rules=>{
+    _rulesCache=rules;
+    const found=rules.find(x=>x.id===id);
+    if(found) editRule(found);
+  });
 }
 
 function editRule(r){

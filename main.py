@@ -115,6 +115,7 @@ def init_db():
             itype TEXT, content TEXT, goals_n INT DEFAULT 0, rules_n INT DEFAULT 0)""")
         if conn.run("SELECT COUNT(*) FROM rules")[0][0] == 0:
             _seed_rules(conn)
+        conn.run("UPDATE rules SET mtype='H1',action_type='H1_OVER_LINE_BEFORE_HT',val_window='HT',description='Over H1 1.50-1.57 at min 17-20 — goal before HT' WHERE rule_name='Early Drop Signal' AND mtype='FT'")
         log.info("DB ready")
     except Exception as e:
         log.error(f"DB init: {e}")
@@ -124,7 +125,7 @@ def init_db():
 def _seed_rules(conn):
     rules = [
         ("Market Shut","Over FT >=2.80 after min 82","FT",1.5,5.5,82,95,2.80,99.0,None,None,0,"UNDER_HOLDS_10M","under","10m","VALIDATED"),
-        ("Early Drop Signal","Over FT 1.50-1.57 at min 17-20","FT",0.5,1.5,17,20,1.50,1.57,None,None,0,"OVER_LINE_WITHIN_10M","over","10m","PROMISING"),
+        ("Early Drop Signal","Over H1 1.50-1.57 at min 17-20 — goal before HT","H1",0.5,1.5,17,20,1.50,1.57,None,None,0,"H1_OVER_LINE_BEFORE_HT","over","HT","PROMISING"),
         ("H1 Minute 18 Pressure","Over H1 1.40-1.60 at min 15-22","H1",0.5,3.5,15,22,1.40,1.60,None,None,0,"H1_OVER_LINE_BEFORE_HT","over","HT","TESTING"),
         ("H1 Under 1.66","Under H1 1.60-1.72 at min 30-38","H1",0.5,3.5,30,38,None,None,1.60,1.72,0,"UNDER_HOLDS_TO_HT","under","HT","TESTING"),
         ("Late FT Goal Hold","Over FT 2.20-2.80 at min 86+","FT",1.5,4.5,86,95,2.20,2.80,None,None,60,"OVER_LINE_BEFORE_FT","over","FT","TESTING"),

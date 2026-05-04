@@ -253,6 +253,7 @@ def parse_event(event):
 
 def save_opening_odds(conn, mid, home, away, league, markets):
     """Save opening odds for a match — only saves once per mid+mtype+line"""
+    saved = 0
     for mkt in markets:
         try:
             conn.run("""INSERT INTO opening_odds (mid,home,away,league,mtype,line,over_open,under_open)
@@ -261,8 +262,11 @@ def save_opening_odds(conn, mid, home, away, league, markets):
                 a=mid,b=home,c=away,d=league,
                 e=mkt["mtype"],f=mkt["line"],
                 g=mkt.get("over"),h=mkt.get("under"))
+            saved += 1
         except Exception as e:
             log.debug(f"Opening odds: {e}")
+    if saved > 0:
+        log.info(f"💾 Opening odds saved: {home} vs {away} — {saved} markets")
 
 def get_opening(conn, mid, mtype, line):
     """Get opening odds for a specific market"""

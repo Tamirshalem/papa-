@@ -178,6 +178,80 @@ def parse_event(event):
             "minute":minute,"score_h":score_h,"score_a":score_a,
             "period":period,"total":score_h+score_a}
 
+def check_rules(conn, mid, home, away, league, minute, sh, sa, period, markets, held_map):
+    try:
+        rules = conn.run("""SELECT id,rule_name,mtype,line_min,line_max,
+            min_min,min_max,over_min,over_max,under_min,under_max,
+            held_min,action_type,side,val_window,status
+            FROM rules WHERE is_active=TRUE""")
+    except Exception as e:
+        log.error(f"Rules fetch: {e}"); return
+
+    for rule in rules:
+        (rid,rname,mtype,lmin,lmax,mmin,mmax,
+         ovmin,ovmax,unmin,unmax,held_min,action,side,val_win,status) = rule
+        if mmin and minute < mmin: continue
+        if mmax and minute > mmax: continue
+
+        for mkt in markets:
+            if mkt["mtype"] != mtype: continue
+            line = mkt["line"]
+            if lmin and line < lmin: continue
+            if lmax and line > lmax: continue
+            over  = mkt.get("over")
+            under = mkt.get("under")
+            if side == "over":
+                if over is None: continue
+                if ovmin and over < ovmin: continue
+                if ovmax and over > ovmax: continue
+                entry_odd = over
+            else:
+                if under is None: continue
+                if unmin and under < unmin: continue
+                if unmax and under > unmax: continue
+                entry_odd = under
+
+            hk = ckey(mid, mtype, str(line))
+            held = held_map.get(hk, 0)
+            if held_min and held < held_min: continue
+
+            exp = get_expected(mtype, str(line), minute)
+            gap = round(exp - entry_odd, 3) if exp and entry_odd else 0
+            op = opening_cache.get(hk)
+            op_side = op.get("over") if op and side=="over" else (op.get("under") if op else None)
+            pres = calc_pressure(entry_odd, op_side, exp) if op_side and exp else 0
+            score_str = f"{sh}-{sa}"
+            confidence = min(95, 50+pres//3+(20 if status=="VALIDATED" else 10 if status=="PROMISING" else 0))
+
+            try:
+                ex = conn.run("SELECT COUNT(*) FROM trades WHERE mid=:a AND rule_id=:b AND validation_window=:c AND result='pending'",
+                    a=mid, b=rid, c=val_win)
+                if ex[0][0] > 0: continue
+
+                conn.run("""INSERT INTO observations
+                    (mid,home,away,league,rule_id,rule_name,minute,score,
+                     mtype,line,over_odd,under_odd,expected_odd,gap,pressure,
+                     action_type,selected_side,entry_odd,confidence,reason)
+                    VALUES (:a,:b,:c,:d,:e,:f,:g,:h,:i,:j,:k,:l,:m,:n,:o,:p,:q,:r,:s,:t)""",
+                    a=mid,b=home,c=away,d=league,e=rid,f=rname,g=minute,h=score_str,
+                    i=mtype,j=line,k=over,l=under,m=exp,n=gap,o=pres,
+                    p=action,q=side,r=entry_odd,s=confidence,
+                    t=f"{rname}: {side} {line} @ {entry_odd} gap={gap:.2f}")
+
+                conn.run("""INSERT INTO trades
+                    (mid,rule_id,rule_name,home,away,league,mtype,line,side,action_type,
+                     entry_odd,expected_odd,entry_min,entry_goals,score_entry,
+                     gap,pressure,validation_window)
+                    VALUES (:a,:b,:c,:d,:e,:f,:g,:h,:i,:j,:k,:l,:m,:n,:o,:p,:q,:r)""",
+                    a=mid,b=rid,c=rname,d=home,e=away,f=league,g=mtype,h=line,
+                    i=side,j=action,k=entry_odd,l=exp,m=minute,n=sh+sa,
+                    o=score_str,p=gap,q=pres,r=val_win)
+
+                conn.run("UPDATE rules SET total_signals=total_signals+1,updated_at=NOW() WHERE id=:a", a=rid)
+                log.info(f"🎯 SIGNAL: {rname} | {home} vs {away} | {mtype}{line} {side}@{entry_odd} min:{minute}")
+            except Exception as e:
+                log.debug(f"Signal: {e}")
+
 def validate_trades(conn):
     try:
         pending = conn.run("""SELECT id,mid,rule_id,action_type,validation_window,

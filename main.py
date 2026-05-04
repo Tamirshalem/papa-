@@ -51,8 +51,31 @@ def parse_db(url):
     return {"host":p.hostname,"port":p.port or 5432,"database":p.path.lstrip("/"),
             "user":p.username,"password":p.password,"ssl_context":True}
 
+# Simple connection pool
+import threading
+_pool_lock = threading.Lock()
+_pool = []
+MAX_POOL = 5
+
 def get_db():
-    return pg8000.native.Connection(**parse_db(DATABASE_URL))
+    with _pool_lock:
+        if _pool:
+            return _pool.pop()
+    try:
+        return pg8000.native.Connection(**parse_db(DATABASE_URL))
+    except Exception as e:
+        log.error(f"DB connect: {e}")
+        raise
+
+def release_db(conn):
+    try:
+        with _pool_lock:
+            if len(_pool) < MAX_POOL:
+                _pool.append(conn)
+                return
+    except: pass
+    try: conn.close()
+    except: pass
 
 def init_db():
     if not DATABASE_URL:
@@ -477,7 +500,7 @@ def collect():
                                markets,held_map)
             validate_trades(conn)
             log.info(f"Saved | live:{live_cnt}/{len(events)}")
-        finally: conn.close()
+        finally: release_db(conn)
     except Exception as e: log.error(f"Collect: {e}")
 
 def collector_loop():
@@ -1183,7 +1206,7 @@ def api_matches():
             return jsonify([{"mid":r[0],"home":r[1],"away":r[2],"home_team":r[1],"away_team":r[2],
                 "league":r[3],"minute":r[4],
                 "score_home":r[5],"score_away":r[6],"total_goals":r[7],"period":r[8],"updated_at":str(r[9])} for r in rows])
-        finally: conn.close()
+        finally: release_db(conn)
     except Exception as e: log.error(f"api_matches: {e}"); return jsonify([])
 
 @app.route("/api/stats")
@@ -1196,7 +1219,7 @@ def api_stats():
             goals = conn.run("SELECT COUNT(*) FROM goals WHERE goal_time>NOW()-INTERVAL '24 hours'")[0][0]
             open_ = conn.run("SELECT COUNT(*) FROM trades WHERE result='pending'")[0][0]
             return jsonify({"live":live,"signals":sigs,"goals_today":goals,"open_trades":open_})
-        finally: conn.close()
+        finally: release_db(conn)
     except: return jsonify({"live":0,"signals":0,"goals_today":0,"open_trades":0})
 
 @app.route("/api/signals")
@@ -1217,7 +1240,7 @@ def api_signals():
                 r["selected_side"]=r["side"]
                 r["market_type"]=r["mtype"]
             return jsonify(result)
-        finally: conn.close()
+        finally: release_db(conn)
     except: return jsonify([])
 
 @app.route("/api/goals")
@@ -1229,7 +1252,7 @@ def api_goals():
             return jsonify([{"mid":r[0],"minute":r[1],"score_before":r[2],"score_after":r[3],
                 "period":r[4],"home":r[5],"away":r[6],"league":r[7],"goal_time":str(r[8]),
                 "home_team":r[5],"away_team":r[6]} for r in rows])
-        finally: conn.close()
+        finally: release_db(conn)
     except: return jsonify([])
 
 @app.route("/api/trades")
@@ -1250,7 +1273,7 @@ def api_trades():
                 r["away_team"]=r["away"]
                 r["validation_window"]=r["val_window"]
             return jsonify(result)
-        finally: conn.close()
+        finally: release_db(conn)
     except: return jsonify([])
 
 @app.route("/api/observations")
@@ -1267,7 +1290,7 @@ def api_observations():
             result=[dict(zip(cols,r)) for r in rows]
             for r in result: r["detected_at"]=str(r["detected_at"])
             return jsonify(result)
-        finally: conn.close()
+        finally: release_db(conn)
     except: return jsonify([])
 
 @app.route("/api/rules")
@@ -1284,7 +1307,7 @@ def api_rules():
             result=[dict(zip(cols,r)) for r in rows]
             for r in result: r["created_at"]=str(r["created_at"])
             return jsonify(result)
-        finally: conn.close()
+        finally: release_db(conn)
     except: return jsonify([])
 
 @app.route("/api/rules/edit", methods=["POST"])
@@ -1308,7 +1331,7 @@ def api_rules_edit():
                 m=d.get("side","over"),n=d.get("val_window","10m"),
                 o=d["id"])
             return jsonify({"status":"ok"})
-        finally: conn.close()
+        finally: release_db(conn)
     except Exception as e:
         log.error(f"Edit rule: {e}")
         return jsonify({"error":str(e)}),500
@@ -1331,7 +1354,7 @@ def api_rules_add():
                 l=d.get("action_type","OVER_LINE_WITHIN_10M"),
                 m=d.get("side","over"),n=d.get("val_window","10m"))
             return jsonify({"status":"ok"})
-        finally: conn.close()
+        finally: release_db(conn)
     except Exception as e:
         log.error(f"Add rule: {e}")
         return jsonify({"error":str(e)}),500
@@ -1347,7 +1370,7 @@ def api_rules_toggle():
             conn.run("UPDATE rules SET is_active=:a WHERE id=:b",
                 a=data["is_active"], b=rule_id)
             return jsonify({"status":"ok"})
-        finally: conn.close()
+        finally: release_db(conn)
     except Exception as e:
         log.error(f"Toggle error: {e}")
         return jsonify({"error":str(e)}),500
@@ -1366,7 +1389,7 @@ def api_analytics():
             top=conn.run("SELECT rule_name,COUNT(*) cnt FROM trades GROUP BY rule_name ORDER BY cnt DESC LIMIT 8")
             return jsonify({"goals":goals,"snapshots":0,"trades":trades,"obs":obs,"hit_rate":rate,
                            "top_rules":[{"name":r[0],"cnt":r[1]} for r in top]})
-        finally: conn.close()
+        finally: release_db(conn)
     except Exception as e:
         log.error(f"Analytics: {e}")
         return jsonify({"goals":0,"snapshots":0,"trades":0,"obs":0,"hit_rate":0})
@@ -1424,7 +1447,7 @@ def api_opening_odds():
                 "mtype":r[4],"line":float(r[5]),
                 "over_open":float(r[6]) if r[6] else None,
                 "under_open":float(r[7]) if r[7] else None} for r in rows])
-        finally: conn.close()
+        finally: release_db(conn)
     except Exception as e: return jsonify({"error":str(e)}),500
 
 @app.route("/api/insights")
@@ -1434,7 +1457,7 @@ def api_insights():
         try:
             rows=conn.run("SELECT itype,content,goals_n,rules_n,created_at FROM insights WHERE itype='market_analysis' ORDER BY created_at DESC LIMIT 10")
             return jsonify([{"itype":r[0],"content":r[1],"goals_n":r[2],"rules_n":r[3],"created_at":str(r[4])} for r in rows])
-        finally: conn.close()
+        finally: release_db(conn)
     except: return jsonify([])
 
 @app.route("/api/ai_live")
@@ -1484,7 +1507,7 @@ Be honest about data limitations. Say 'insufficient data' for specific claims ne
                     a=text,b=len(goals),c=len(rules))
                 return jsonify({"status":"ok"})
             return jsonify({"error":f"Claude API returned {resp.status_code}: {resp.text[:200]}"}),500
-        finally: conn.close()
+        finally: release_db(conn)
     except Exception as e:
         log.error(f"run_ai: {e}")
         return jsonify({"error":str(e)}),500
@@ -1560,7 +1583,7 @@ def api_ai_rules():
                         except: pass
                     return jsonify({"status":"ok","new_rules":count})
             return jsonify({"error":f"Claude {resp.status_code}"}),500
-        finally: conn.close()
+        finally: release_db(conn)
     except Exception as e: return jsonify({"error":str(e)}),500
 
 
@@ -1622,7 +1645,7 @@ Return ONLY JSON: {json_example}"""
                         except: pass
                     return jsonify({"status":"ok","new_rules":count})
             return jsonify({"error":f"Claude {resp.status_code}"}),500
-        finally: conn.close()
+        finally: release_db(conn)
     except Exception as e: return jsonify({"error":str(e)}),500
 
 init_db()

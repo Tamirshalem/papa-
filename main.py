@@ -116,6 +116,8 @@ def init_db():
         if conn.run("SELECT COUNT(*) FROM rules")[0][0] == 0:
             _seed_rules(conn)
         conn.run("UPDATE rules SET mtype='H1',action_type='H1_OVER_LINE_BEFORE_HT',val_window='HT',description='Over H1 1.50-1.57 at min 17-20 — goal before HT' WHERE rule_name='Early Drop Signal' AND mtype='FT'")
+        conn.run("UPDATE rules SET val_window='5m' WHERE rule_name='Late FT Goal Hold' AND val_window='FT'")
+        conn.run("UPDATE rules SET side='under' WHERE rule_name='Market Shut' AND side='over'")
         log.info("DB ready")
     except Exception as e:
         log.error(f"DB init: {e}")
@@ -128,7 +130,7 @@ def _seed_rules(conn):
         ("Early Drop Signal","Over H1 1.50-1.57 at min 17-20 — goal before HT","H1",0.5,1.5,17,20,1.50,1.57,None,None,0,"H1_OVER_LINE_BEFORE_HT","over","HT","PROMISING"),
         ("H1 Minute 18 Pressure","Over H1 1.40-1.60 at min 15-22","H1",0.5,3.5,15,22,1.40,1.60,None,None,0,"H1_OVER_LINE_BEFORE_HT","over","HT","TESTING"),
         ("H1 Under 1.66","Under H1 1.60-1.72 at min 30-38","H1",0.5,3.5,30,38,None,None,1.60,1.72,0,"UNDER_HOLDS_TO_HT","under","HT","TESTING"),
-        ("Late FT Goal Hold","Over FT 2.20-2.80 at min 86+","FT",1.5,4.5,86,95,2.20,2.80,None,None,60,"OVER_LINE_BEFORE_FT","over","FT","TESTING"),
+        ("Late FT Goal Hold","FT Over 2.20-2.80 at min 86+ — goal in final minutes","FT",1.5,4.5,86,95,2.20,2.80,None,None,60,"OVER_LINE_BEFORE_FT","over","5m","TESTING"),
     ]
     for r in rules:
         try:
@@ -188,11 +190,16 @@ def check_rules(conn, mid, home, away, league, minute, sh, sa, period, markets, 
     except Exception as e:
         log.error(f"Rules fetch: {e}"); return
 
+    total_goals = sh + sa
+
     for rule in rules:
         (rid,rname,mtype,lmin,lmax,mmin,mmax,
          ovmin,ovmax,unmin,unmax,held_min,action,side,val_win,status) = rule
         if mmin and minute < mmin: continue
         if mmax and minute > mmax: continue
+
+        # Special condition: FT Late Comeback requires 2+ goals already
+        if rname == "FT Late Comeback Signal" and total_goals < 2: continue
 
         for mkt in markets:
             if mkt["mtype"] != mtype: continue
@@ -1155,6 +1162,22 @@ def api_ai_rules():
             goals=conn.run("SELECT minute,period FROM goals ORDER BY goal_time DESC LIMIT 100")
             rules=conn.run("SELECT rule_name,total_signals,win_rate FROM rules ORDER BY total_signals DESC")
             prompt=f"""Suggest new PapaGoal rules. {len(goals)} goals. Rules: {[(r[0],r[1],r[2]) for r in rules]}.
+PapaGoal Rule System Guide:
+- side="over": bet that Over line will be crossed (goal will happen)  
+- side="under": bet that Under line will hold (no goal will happen)
+- action_type options:
+  * OVER_LINE_WITHIN_10M: goal expected in next 10 minutes
+  * H1_OVER_LINE_BEFORE_HT: goal expected before half time
+  * UNDER_HOLDS_10M: no goal for next 10 minutes  
+  * UNDER_HOLDS_TO_HT: no goal until half time
+  * OVER_LINE_BEFORE_FT: goal expected before full time end
+  * OVER_LINE_WITHIN_15M: goal expected in next 15 minutes
+- val_window: "10m","15m","5m","HT","FT"
+- mtype: "FT"=full match odds, "H1"=first half odds only
+- over_min/over_max: trigger when Over odd is in this range
+- under_min/under_max: trigger when Under odd is in this range
+- The goal is to find mispriced odds — when market odds suggest something different than what we expect
+
 Return ONLY JSON: {{"new_rules":[{{"rule_name":"name","description":"desc","mtype":"FT","line_min":0.5,"line_max":2.5,"min_min":17,"min_max":20,"over_min":1.50,"over_max":1.60,"under_min":null,"under_max":null,"held_min":0,"action_type":"OVER_LINE_WITHIN_10M","side":"over","val_window":"10m"}}],"insights":"2 sentences"}}"""
             resp=requests.post("https://api.anthropic.com/v1/messages",
                 headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"},

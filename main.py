@@ -125,8 +125,8 @@ def init_db():
             total_signals=(SELECT COUNT(*) FROM trades t WHERE t.rule_id=r.id),
             profit=(SELECT COALESCE(SUM(t.profit),0) FROM trades t WHERE t.rule_id=r.id AND t.result!='pending'),
             win_rate=CASE WHEN (SELECT COUNT(*) FROM trades t WHERE t.rule_id=r.id AND t.result!='pending')>0
-                THEN ROUND((SELECT COUNT(*) FROM trades t WHERE t.rule_id=r.id AND t.result='win')::float/
-                    (SELECT COUNT(*) FROM trades t WHERE t.rule_id=r.id AND t.result!='pending')*100,1)
+                THEN ROUND((SELECT COUNT(*) FROM trades t WHERE t.rule_id=r.id AND t.result='win')::numeric/
+                    NULLIF((SELECT COUNT(*) FROM trades t WHERE t.rule_id=r.id AND t.result!='pending'),0)*100,1)
                 ELSE 0 END""")
         log.info("DB ready")
     except Exception as e:

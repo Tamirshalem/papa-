@@ -860,7 +860,7 @@ async function loadDebug(){
     const tried=(d.tried||[]).map(t=>`
       <div style="display:flex;gap:10px;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);font-size:12px;flex-wrap:wrap">
         <span style="color:${t.has_totals?'var(--green)':'var(--muted)'}">${t.has_totals?'✅':'—'}</span>
-        <span style="font-weight:600">${t.home||t.home_team||"?"} vs ${t.away||t.away_team||"?"}</span>
+        <span style="font-weight:600">${t.home||t.home_team||'?'} vs ${t.away||t.away_team||'?'}</span>
         <span style="color:var(--muted);font-size:10px">${t.league}</span>
         <span style="color:var(--blue);font-family:monospace;font-size:11px">[${(t.markets||[]).join(', ')}]</span>
       </div>`).join('');

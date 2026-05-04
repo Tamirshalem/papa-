@@ -1161,14 +1161,15 @@ def api_ai_rules():
         try:
             goals=conn.run("SELECT minute,period FROM goals ORDER BY goal_time DESC LIMIT 100")
             rules=conn.run("SELECT rule_name,total_signals,win_rate FROM rules ORDER BY total_signals DESC")
+            json_example = '{"new_rules":[{"rule_name":"name","description":"desc","mtype":"FT","line_min":0.5,"line_max":2.5,"min_min":17,"min_max":20,"over_min":1.50,"over_max":1.60,"under_min":null,"under_max":null,"held_min":0,"action_type":"OVER_LINE_WITHIN_10M","side":"over","val_window":"10m"}],"insights":"2 sentences"}'
             prompt=f"""Suggest new PapaGoal rules. {len(goals)} goals. Rules: {[(r[0],r[1],r[2]) for r in rules]}.
 PapaGoal Rule System Guide:
-- side="over": bet that Over line will be crossed (goal will happen)  
+- side="over": bet that Over line will be crossed (goal will happen)
 - side="under": bet that Under line will hold (no goal will happen)
 - action_type options:
   * OVER_LINE_WITHIN_10M: goal expected in next 10 minutes
   * H1_OVER_LINE_BEFORE_HT: goal expected before half time
-  * UNDER_HOLDS_10M: no goal for next 10 minutes  
+  * UNDER_HOLDS_10M: no goal for next 10 minutes
   * UNDER_HOLDS_TO_HT: no goal until half time
   * OVER_LINE_BEFORE_FT: goal expected before full time end
   * OVER_LINE_WITHIN_15M: goal expected in next 15 minutes
@@ -1178,7 +1179,7 @@ PapaGoal Rule System Guide:
 - under_min/under_max: trigger when Under odd is in this range
 - The goal is to find mispriced odds — when market odds suggest something different than what we expect
 
-Return ONLY JSON: {{"new_rules":[{{"rule_name":"name","description":"desc","mtype":"FT","line_min":0.5,"line_max":2.5,"min_min":17,"min_max":20,"over_min":1.50,"over_max":1.60,"under_min":null,"under_max":null,"held_min":0,"action_type":"OVER_LINE_WITHIN_10M","side":"over","val_window":"10m"}}],"insights":"2 sentences"}}"""
+Return ONLY JSON: {json_example}"""
             resp=requests.post("https://api.anthropic.com/v1/messages",
                 headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"},
                 json={"model":"claude-sonnet-4-5","max_tokens":800,"messages":[{"role":"user","content":prompt}]},timeout=30)

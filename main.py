@@ -672,10 +672,10 @@ async function loadTrades(){
         const bc=t.result==='pending'?'var(--yellow)':t.result==='win'?'var(--green)':'var(--red)';
         return `<div class="card" style="border-color:${bc}33">
           <div class="ctop">
-            <div><div class="mn">${t.home_team} vs ${t.away_team}</div>
-            <div class="ml">${t.rule_name} · ${t.market_type} ${t.line} ${t.selected_side?.toUpperCase()}</div></div>
+            <div><div class="mn">${t.home||t.home_team||'?'} vs ${t.away||t.away_team||'?'}</div>
+            <div class="ml">${t.rule_name} · ${t.mtype||t.market_type||'FT'} ${t.line||''} ${(t.side||t.selected_side||'').toUpperCase()}</div></div>
             <div class="bgs">
-              ${t.minute_entry>0?`<span class="bg bgb">⏱ ${t.minute_entry}'</span>`:''}
+              ${(t.minute_entry||t.entry_min)>0?`<span class="bg bgb">⏱ ${t.minute_entry||t.entry_min}'</span>`:''}
               <span class="bg ${rc}">${rl}</span>
             </div>
           </div>
@@ -683,11 +683,11 @@ async function loadTrades(){
             <div class="ot"><div class="ol">ENTRY ODD</div><div class="ov" style="color:var(--yellow)">${t.entry_odd||'—'}</div></div>
             <div class="ot"><div class="ol">EXPECTED</div><div class="ov">${t.expected_odd||'—'}</div></div>
             <div class="ot"><div class="ol">GAP</div><div class="ov" style="color:var(--blue)">${t.gap||0}</div></div>
-            <div class="ot"><div class="ol">PRESSURE</div><div class="ov">${t.pressure_score||0}%</div></div>
-            ${t.result!=='pending'?`<div class="ot"><div class="ol">P&L</div><div class="ov" style="color:${(t.dummy_profit_loss||0)>=0?'var(--green)':'var(--red)'}">€${(t.dummy_profit_loss||0).toFixed(0)}</div></div>`:''}
+            <div class="ot"><div class="ol">PRESSURE</div><div class="ov">${t.pressure||t.pressure_score||0}%</div></div>
+            ${t.result!=='pending'?`<div class="ot"><div class="ol">P&L</div><div class="ov" style="color:${(t.profit||t.dummy_profit_loss||0)>=0?'var(--green)':'var(--red)'}">€${(t.profit||t.dummy_profit_loss||0).toFixed(0)}</div></div>`:''}
           </div>
-          <div style="font-size:11px;color:var(--muted)">${t.action_type} · ${t.validation_window} window · Score: ${t.score_entry||'?'}</div>
-          ${t.failure_reason?`<div style="font-size:11px;color:var(--red);margin-top:4px">Reason: ${t.failure_reason}</div>`:''}
+          <div style="font-size:11px;color:var(--muted)">${t.action_type} · ${t.val_window||t.validation_window||""} window · Score: ${t.score_entry||"—"}</div>
+          ${(t.fail_reason||t.failure_reason)?`<div style="font-size:11px;color:var(--red);margin-top:4px">${t.fail_reason||t.failure_reason}</div>`:""}
         </div>`;
       }).join('')}`;
 }

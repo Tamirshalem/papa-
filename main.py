@@ -306,6 +306,7 @@ def collect():
         conn = get_db()
         try:
             live_cnt = 0
+            held_map = {}
             for event in events:
                 p = parse_event(event)
                 if not p["home"] or not p["away"]: continue

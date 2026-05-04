@@ -300,9 +300,9 @@ def validate_trades(conn):
             if goals_since>0 and line_crossed: result="win"
             elif elapsed>7: result,fail="lose","No goal in 5min"
         elif action == "UNDER_HOLDS_10M":
-            if goals_since>0 and line_crossed: result,fail="lose","Line crossed"
-            elif cur_period=="FT": result="win" if not line_crossed else "lose"; fail="Line crossed at FT" if result=="lose" else None
-            elif elapsed>12 and not line_crossed: result="win"
+            if line_crossed: result,fail="lose","Line crossed"
+            elif cur_period=="FT": result="win"
+            elif elapsed>14 and not line_crossed: result="win"
         elif action in ("H1_OVER_LINE_BEFORE_HT","H1_GOAL_BEFORE_HT"):
             ht = cur_period in ("H2","FT") or (cur_period=="H1" and (cur_min or 0)>=46)
             if ht: result="win" if line_crossed else "lose"; fail="Not crossed by HT" if result=="lose" else None
@@ -880,6 +880,71 @@ async function runAI(){
   setTimeout(()=>{btn.disabled=false;btn.textContent='🤖 Run Analysis';},3000);
 }
 
+function openAddRule(){
+  document.getElementById('add-rule-modal').style.display='flex';
+  updatePreview();
+}
+function closeAddRule(){
+  document.getElementById('add-rule-modal').style.display='none';
+}
+function updatePreview(){
+  const name=document.getElementById('ar-name').value||'New Rule';
+  const mtype=document.getElementById('ar-mtype').value;
+  const side=document.getElementById('ar-side').value;
+  const mins=document.getElementById('ar-minutes').value;
+  const odds=document.getElementById('ar-odds').value;
+  const win=document.getElementById('ar-window').value;
+  const line=document.getElementById('ar-line').value;
+  const sideText=side==='over'?'🎯 Goal expected':'🛡 No goal expected';
+  document.getElementById('ar-preview').innerHTML=
+    `<b style="color:var(--text)">${name}</b><br>
+    ${sideText} · ${mtype} · Line ${line.split('-')[0]} · Min ${mins} · Over ${odds} · Check: ${win}`;
+}
+// Update preview on change
+setTimeout(()=>{
+  ['ar-name','ar-mtype','ar-side','ar-minutes','ar-odds','ar-window','ar-line'].forEach(id=>{
+    const el=document.getElementById(id);
+    if(el) el.addEventListener('input',updatePreview),el.addEventListener('change',updatePreview);
+  });
+},500);
+
+async function saveRule(){
+  const name=document.getElementById('ar-name').value.trim();
+  if(!name){alert('Please enter a rule name');return;}
+  const mtype=document.getElementById('ar-mtype').value;
+  const side=document.getElementById('ar-side').value;
+  const [minMin,minMax]=document.getElementById('ar-minutes').value.split('-').map(Number);
+  const [ovMin,ovMax]=document.getElementById('ar-odds').value.split('-').map(Number);
+  const win=document.getElementById('ar-window').value;
+  const [lineMin,lineMax]=document.getElementById('ar-line').value.split('-').map(Number);
+  
+  const actionMap={
+    'over':{'5m':'OVER_LINE_WITHIN_5M','10m':'OVER_LINE_WITHIN_10M','15m':'OVER_LINE_WITHIN_15M','HT':'H1_OVER_LINE_BEFORE_HT','FT':'OVER_LINE_BEFORE_FT'},
+    'under':{'5m':'UNDER_HOLDS_10M','10m':'UNDER_HOLDS_10M','15m':'UNDER_HOLDS_10M','HT':'UNDER_HOLDS_TO_HT','FT':'UNDER_HOLDS_10M'}
+  };
+  const action=actionMap[side][win]||'OVER_LINE_WITHIN_10M';
+  
+  const body={
+    rule_name:name,
+    description:`${mtype} Over ${ovMin}-${ovMax} at min ${minMin}-${minMax}`,
+    mtype,side,
+    min_min:minMin,min_max:minMax,
+    over_min:side==='over'?ovMin:null,
+    over_max:side==='over'?ovMax:null,
+    under_min:side==='under'?ovMin:null,
+    under_max:side==='under'?ovMax:null,
+    line_min:lineMin,line_max:lineMax,
+    action_type:action,
+    val_window:win
+  };
+  try{
+    const r=await fetch('/api/rules/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const d=await r.json();
+    if(d.status==='ok'){closeAddRule();loadRules();alert('Rule saved!');}
+    else alert('Error: '+d.error);
+  }catch(e){alert('Error: '+e.message);}
+}
+
 async function loadDebug(){
   const el=document.getElementById('debug-content');
   el.innerHTML='<div class="empty">⏳ Fetching from odds-api.io...</div>';
@@ -1040,6 +1105,29 @@ def api_rules():
             return jsonify(result)
         finally: conn.close()
     except: return jsonify([])
+
+@app.route("/api/rules/add", methods=["POST"])
+def api_rules_add():
+    try:
+        d=request.json
+        conn=get_db()
+        try:
+            conn.run("""INSERT INTO rules 
+                (rule_name,description,source,mtype,line_min,line_max,min_min,min_max,
+                over_min,over_max,under_min,under_max,held_min,action_type,side,val_window,status,is_active)
+                VALUES (:a,:b,'manual',:c,:d,:e,:f,:g,:h,:i,:j,:k,0,:l,:m,:n,'TESTING',TRUE)""",
+                a=d["rule_name"],b=d.get("description",""),c=d.get("mtype","FT"),
+                d=d.get("line_min",0.5),e=d.get("line_max",3.5),
+                f=d.get("min_min",0),g=d.get("min_max",90),
+                h=d.get("over_min"),i=d.get("over_max"),
+                j=d.get("under_min"),k=d.get("under_max"),
+                l=d.get("action_type","OVER_LINE_WITHIN_10M"),
+                m=d.get("side","over"),n=d.get("val_window","10m"))
+            return jsonify({"status":"ok"})
+        finally: conn.close()
+    except Exception as e:
+        log.error(f"Add rule: {e}")
+        return jsonify({"error":str(e)}),500
 
 @app.route("/api/rules/toggle", methods=["POST"])
 def api_rules_toggle():

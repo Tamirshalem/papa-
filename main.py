@@ -116,6 +116,16 @@ def init_db():
         if conn.run("SELECT COUNT(*) FROM rules")[0][0] == 0:
             _seed_rules(conn)
         conn.run("UPDATE rules SET mtype='H1',action_type='H1_OVER_LINE_BEFORE_HT',val_window='HT',description='Over H1 1.50-1.57 at min 17-20 — goal before HT' WHERE rule_name='Early Drop Signal' AND mtype='FT'")
+        # Fix trades where UNDER won but line was actually crossed (score_entry goals < final goals)
+        conn.run("""UPDATE trades SET result='lose',fail_reason='Line crossed — corrected',
+            profit=-100
+            WHERE result='win' AND side='under' AND action_type='UNDER_HOLDS_10M'
+            AND id IN (
+                SELECT t.id FROM trades t
+                JOIN matches m ON t.mid=m.mid
+                WHERE t.result='win' AND t.side='under' 
+                AND m.total_goals > t.line
+            )""")
         conn.run("UPDATE rules SET over_min=2.70,description='FT Over >=2.70 after min 82 — hold Under' WHERE rule_name='Market Shut'")
         conn.run("UPDATE rules SET over_min=2.00,over_max=2.65,min_min=85,min_max=95,description='FT Over 2.00-2.65 at min 85+ — market expects goal' WHERE rule_name='Late FT Goal Hold'")
         conn.run("UPDATE rules SET side='under' WHERE rule_name='Market Shut' AND side='over'")

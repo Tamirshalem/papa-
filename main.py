@@ -635,7 +635,7 @@ async function loadGoals(){
     const getOdd=k=>Object.entries(snap).find(([key])=>key.includes(k))?.[1]?.over?.toFixed(2)||'—';
     return `<div class="card win">
       <div class="ctop">
-        <div><div class="mn">${g.home_team||''} vs ${g.away_team||''}</div><div class="ml">${g.league||''} · ${g.period||'FT'}</div></div>
+        <div><div class="mn">${g.home||g.home_team||'?'} vs ${g.away||g.away_team||'?'}</div><div class="ml">${g.league||''} · ${g.period||'FT'}</div></div>
         <div style="font-size:16px;font-weight:700;font-family:'JetBrains Mono',monospace;color:var(--green)">⚽ Min ${g.minute}</div>
       </div>
       <div style="font-size:12px;color:var(--muted);margin-bottom:6px">${g.score_before||'?'} → ${g.score_after||'?'} ${g.had_snapshots?'✅ has odds data':'⚠️ no odds yet'}</div>
@@ -953,7 +953,8 @@ def api_goals():
         try:
             rows = conn.run("SELECT mid,minute,score_before,score_after,period,home,away,league,goal_time FROM goals ORDER BY goal_time DESC LIMIT 50")
             return jsonify([{"mid":r[0],"minute":r[1],"score_before":r[2],"score_after":r[3],
-                "period":r[4],"home":r[5],"away":r[6],"league":r[7],"goal_time":str(r[8])} for r in rows])
+                "period":r[4],"home":r[5],"away":r[6],"league":r[7],"goal_time":str(r[8]),
+                "home_team":r[5],"away_team":r[6]} for r in rows])
         finally: conn.close()
     except: return jsonify([])
 

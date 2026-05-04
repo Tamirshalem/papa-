@@ -136,6 +136,16 @@ def init_db():
         conn.run("""CREATE TABLE IF NOT EXISTS insights (
             id SERIAL PRIMARY KEY, created_at TIMESTAMPTZ DEFAULT NOW(),
             itype TEXT, content TEXT, goals_n INT DEFAULT 0, rules_n INT DEFAULT 0)""")
+        conn.run("""CREATE TABLE IF NOT EXISTS odds_snapshots (
+            id SERIAL PRIMARY KEY,
+            mid TEXT NOT NULL,
+            minute INT,
+            mtype TEXT,
+            line NUMERIC,
+            over_odd NUMERIC,
+            under_odd NUMERIC,
+            saved_at TIMESTAMPTZ DEFAULT NOW())""")
+        conn.run("CREATE INDEX IF NOT EXISTS idx_snapshots_mid ON odds_snapshots(mid,saved_at DESC)")
         conn.run("""CREATE TABLE IF NOT EXISTS opening_odds (
             id SERIAL PRIMARY KEY,
             mid TEXT NOT NULL,
@@ -785,18 +795,33 @@ async function loadGoals(){
   const el=document.getElementById('goals-list');
   if(!goals.length){el.innerHTML='<div class="empty"><div style="font-size:42px">⚽</div><div>No goals yet</div></div>';return;}
   el.innerHTML=goals.map(g=>{
-    const snap=g.odds_30s||{};
-    const getOdd=k=>Object.entries(snap).find(([key])=>key.includes(k))?.[1]?.over?.toFixed(2)||'—';
+    const snap30 = g.odds_30s||[];
+    const snap60 = g.odds_60s||[];
+    const fmtOdds = (snaps) => {
+      if(!snaps.length) return '<span style="color:var(--muted)">no data</span>';
+      return snaps.filter(s=>s.mtype==='FT'||s.mtype==='H1').slice(0,4).map(s=>
+        `<div style="font-size:11px;font-family:monospace">
+          <span style="color:var(--muted)">${s.mtype} ${s.line}</span>
+          <span style="color:var(--green)"> O:${s.over?.toFixed(2)||'—'}</span>
+          <span style="color:var(--red)"> U:${s.under?.toFixed(2)||'—'}</span>
+        </div>`
+      ).join('') || '<span style="color:var(--muted)">no data</span>';
+    };
     return `<div class="card win">
       <div class="ctop">
         <div><div class="mn">${g.home||g.home_team||'?'} vs ${g.away||g.away_team||'?'}</div><div class="ml">${g.league||''} · ${g.period||'FT'}</div></div>
         <div style="font-size:16px;font-weight:700;font-family:'JetBrains Mono',monospace;color:var(--green)">⚽ Min ${g.minute}</div>
       </div>
-      <div style="font-size:12px;color:var(--muted);margin-bottom:6px">${g.score_before||'?'} → ${g.score_after||'?'} ${g.had_snapshots?'✅ has odds data':'⚠️ no odds yet'}</div>
-      <div class="stit" style="margin-bottom:8px">Over odds before goal</div>
-      <div class="otg">
-        <div class="otc"><div class="ol">30s before</div><div class="ov" style="color:var(--green)">${getOdd('FT')}</div></div>
-        <div class="otc"><div class="ol">60s before</div><div class="ov" style="color:var(--green)">${getOdd('H1')}</div></div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:8px">${g.score_before||'?'} → ${g.score_after||'?'}</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+        <div style="background:var(--bg);border-radius:6px;padding:8px">
+          <div style="font-size:10px;color:var(--muted);margin-bottom:4px">~30s before</div>
+          ${fmtOdds(snap30)}
+        </div>
+        <div style="background:var(--bg);border-radius:6px;padding:8px">
+          <div style="font-size:10px;color:var(--muted);margin-bottom:4px">~60s before</div>
+          ${fmtOdds(snap60)}
+        </div>
       </div>
     </div>`;
   }).join('');
@@ -1249,9 +1274,27 @@ def api_goals():
         conn = get_db()
         try:
             rows = conn.run("SELECT mid,minute,score_before,score_after,period,home,away,league,goal_time FROM goals ORDER BY goal_time DESC LIMIT 50")
-            return jsonify([{"mid":r[0],"minute":r[1],"score_before":r[2],"score_after":r[3],
-                "period":r[4],"home":r[5],"away":r[6],"league":r[7],"goal_time":str(r[8]),
-                "home_team":r[5],"away_team":r[6]} for r in rows])
+            result = []
+            for r in rows:
+                mid,minute,sb,sa,period,home,away,league,gt = r
+                # Get odds 30s and 60s before goal
+                snap30 = conn.run("""SELECT mtype,line,over_odd,under_odd FROM odds_snapshots
+                    WHERE mid=:a AND minute>=:b AND minute<=:c
+                    ORDER BY saved_at DESC LIMIT 10""",
+                    a=mid,b=max(0,minute-2),c=minute)
+                snap60 = conn.run("""SELECT mtype,line,over_odd,under_odd FROM odds_snapshots
+                    WHERE mid=:a AND minute>=:b AND minute<=:c
+                    ORDER BY saved_at DESC LIMIT 10""",
+                    a=mid,b=max(0,minute-3),c=minute-1)
+                result.append({
+                    "mid":mid,"minute":minute,"score_before":sb,"score_after":sa,
+                    "period":period,"home":home,"away":away,"league":league,
+                    "goal_time":str(gt),"home_team":home,"away_team":away,
+                    "odds_30s":[{"mtype":s[0],"line":float(s[1]),"over":float(s[2]) if s[2] else None,"under":float(s[3]) if s[3] else None} for s in snap30],
+                    "odds_60s":[{"mtype":s[0],"line":float(s[1]),"over":float(s[2]) if s[2] else None,"under":float(s[3]) if s[3] else None} for s in snap60],
+                    "had_snapshots":len(snap30)>0
+                })
+            return jsonify(result)
         finally: release_db(conn)
     except: return jsonify([])
 

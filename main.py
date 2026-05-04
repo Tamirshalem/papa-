@@ -118,6 +118,16 @@ def init_db():
         conn.run("UPDATE rules SET mtype='H1',action_type='H1_OVER_LINE_BEFORE_HT',val_window='HT',description='Over H1 1.50-1.57 at min 17-20 — goal before HT' WHERE rule_name='Early Drop Signal' AND mtype='FT'")
         conn.run("UPDATE rules SET val_window='5m' WHERE rule_name='Late FT Goal Hold' AND val_window='FT'")
         conn.run("UPDATE rules SET side='under' WHERE rule_name='Market Shut' AND side='over'")
+        # Sync rules stats from existing resolved trades
+        conn.run("""UPDATE rules r SET
+            wins=(SELECT COUNT(*) FROM trades t WHERE t.rule_id=r.id AND t.result='win'),
+            losses=(SELECT COUNT(*) FROM trades t WHERE t.rule_id=r.id AND t.result='lose'),
+            total_signals=(SELECT COUNT(*) FROM trades t WHERE t.rule_id=r.id),
+            profit=(SELECT COALESCE(SUM(t.profit),0) FROM trades t WHERE t.rule_id=r.id AND t.result!='pending'),
+            win_rate=CASE WHEN (SELECT COUNT(*) FROM trades t WHERE t.rule_id=r.id AND t.result!='pending')>0
+                THEN ROUND((SELECT COUNT(*) FROM trades t WHERE t.rule_id=r.id AND t.result='win')::float/
+                    (SELECT COUNT(*) FROM trades t WHERE t.rule_id=r.id AND t.result!='pending')*100,1)
+                ELSE 0 END""")
         log.info("DB ready")
     except Exception as e:
         log.error(f"DB init: {e}")
@@ -282,6 +292,12 @@ def validate_trades(conn):
         if action == "OVER_LINE_WITHIN_10M":
             if goals_since>0 and line_crossed: result="win"
             elif elapsed>12: result,fail="lose","No goal in 10min"
+        elif action == "OVER_LINE_WITHIN_15M":
+            if goals_since>0 and line_crossed: result="win"
+            elif elapsed>17: result,fail="lose","No goal in 15min"
+        elif action == "OVER_LINE_WITHIN_5M":
+            if goals_since>0 and line_crossed: result="win"
+            elif elapsed>7: result,fail="lose","No goal in 5min"
         elif action == "UNDER_HOLDS_10M":
             if goals_since>0 and line_crossed: result,fail="lose","Line crossed"
             elif elapsed>12: result="win"
@@ -298,6 +314,8 @@ def validate_trades(conn):
             elif elapsed>35: result,fail="lose","FT timeout"
         if result:
             profit = round((float(entry_odd or 1)-1)*100,2) if result=="win" else -100.0
+            emoji = "✅ WIN" if result=="win" else "❌ LOSE"
+            log.info(f"{emoji} | {action} | {side}@{entry_odd} | {fail or 'resolved'} | P&L: €{profit:+.0f}")
             try:
                 conn.run("""UPDATE trades SET result=:a,resolved_at=NOW(),profit=:b,fail_reason=:c WHERE id=:d""",
                     a=result,b=profit,c=fail,d=tid)

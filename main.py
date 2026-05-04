@@ -824,10 +824,10 @@ async function loadAnalytics(){
   const data=await fetch('/api/analytics').then(r=>r.json()).catch(()=>({}));
   const el=document.getElementById('analytics-content');
   const targets=[
-    {l:"Goals collected",v:data.total_goals,t:500,c:"var(--green)"},
-    {l:"Snapshots saved",v:data.total_snapshots,t:50000,c:"var(--blue)"},
-    {l:"Paper trades",v:data.total_trades,t:200,c:"var(--purple)"},
-    {l:"Observations",v:data.total_obs,t:1000,c:"var(--yellow)"}
+    {l:"Goals collected",v:data.goals||data.total_goals||0,t:500,c:"var(--green)"},
+    {l:"Snapshots saved",v:data.snapshots||data.total_snapshots||0,t:50000,c:"var(--blue)"},
+    {l:"Paper trades",v:data.trades||data.total_trades||0,t:200,c:"var(--purple)"},
+    {l:"Observations",v:data.obs||data.total_obs||0,t:1000,c:"var(--yellow)"}
   ];
   el.innerHTML=`
     <div class="sr">
@@ -1156,11 +1156,13 @@ def api_analytics():
             wins=conn.run("SELECT COUNT(*) FROM trades WHERE result='win'")[0][0]
             done=conn.run("SELECT COUNT(*) FROM trades WHERE result!='pending'")[0][0]
             rate=round(wins/done*100) if done>0 else 0
-            top=conn.run("SELECT rule_name,COUNT(*) cnt FROM observations GROUP BY rule_name ORDER BY cnt DESC LIMIT 8")
+            top=conn.run("SELECT rule_name,COUNT(*) cnt FROM trades GROUP BY rule_name ORDER BY cnt DESC LIMIT 8")
             return jsonify({"goals":goals,"snapshots":0,"trades":trades,"obs":obs,"hit_rate":rate,
                            "top_rules":[{"name":r[0],"cnt":r[1]} for r in top]})
         finally: conn.close()
-    except: return jsonify({"goals":0,"snapshots":0,"trades":0,"obs":0,"hit_rate":0})
+    except Exception as e:
+        log.error(f"Analytics: {e}")
+        return jsonify({"goals":0,"snapshots":0,"trades":0,"obs":0,"hit_rate":0})
 
 @app.route("/api/debug_odds")
 def api_debug_odds():

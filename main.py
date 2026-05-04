@@ -673,7 +673,7 @@ async function loadTrades(){
         return `<div class="card" style="border-color:${bc}33">
           <div class="ctop">
             <div><div class="mn">${t.home||t.home_team||'?'} vs ${t.away||t.away_team||'?'}</div>
-            <div class="ml">${t.rule_name} · ${t.mtype||t.market_type||'FT'} ${t.line||''} ${(t.side||t.selected_side||'').toUpperCase()}</div></div>
+            <div class="ml">${t.rule_name} · ${(t.mtype||'FT')==='H1'?'First Half':'Full Match'} · Line ${t.line||''} · ${(t.side||'').toUpperCase()==='OVER'?'⬆ OVER':'⬇ UNDER'}</div></div>
             <div class="bgs">
               ${(t.minute_entry||t.entry_min)>0?`<span class="bg bgb">⏱ ${t.minute_entry||t.entry_min}'</span>`:''}
               <span class="bg ${rc}">${rl}</span>
@@ -686,7 +686,7 @@ async function loadTrades(){
             <div class="ot"><div class="ol">PRESSURE</div><div class="ov">${t.pressure||t.pressure_score||0}%</div></div>
             ${t.result!=='pending'?`<div class="ot"><div class="ol">P&L</div><div class="ov" style="color:${(t.profit||t.dummy_profit_loss||0)>=0?'var(--green)':'var(--red)'}">€${(t.profit||t.dummy_profit_loss||0).toFixed(0)}</div></div>`:''}
           </div>
-          <div style="font-size:11px;color:var(--muted)">${t.action_type} · ${t.val_window||t.validation_window||""} window · Score: ${t.score_entry||"—"}</div>
+          <div style="font-size:11px;color:var(--muted)">${{'OVER_LINE_WITHIN_10M':'🎯 Goal expected within 10min','OVER_LINE_WITHIN_5M':'🎯 Goal expected within 5min','UNDER_HOLDS_10M':'🛡 No goal for 10min','H1_OVER_LINE_BEFORE_HT':'🎯 Goal before Half Time','UNDER_HOLDS_TO_HT':'🛡 No goal until Half Time','OVER_LINE_BEFORE_FT':'🎯 Goal before Full Time'}[t.action_type]||t.action_type} · Window: ${t.val_window||'10m'} · Score at entry: ${t.score_entry||'—'}</div>
           ${(t.fail_reason||t.failure_reason)?`<div style="font-size:11px;color:var(--red);margin-top:4px">${t.fail_reason||t.failure_reason}</div>`:""}
         </div>`;
       }).join('')}`;

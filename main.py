@@ -831,9 +831,9 @@ async function loadAnalytics(){
   ];
   el.innerHTML=`
     <div class="sr">
-      <div class="sc"><div class="sn" style="color:var(--green)">${data.total_goals||0}</div><div class="sl">Goals</div></div>
-      <div class="sc"><div class="sn" style="color:var(--blue)">${(data.total_snapshots||0).toLocaleString()}</div><div class="sl">Snapshots</div></div>
-      <div class="sc"><div class="sn" style="color:var(--yellow)">${data.total_obs||0}</div><div class="sl">Observations</div></div>
+      <div class="sc"><div class="sn" style="color:var(--green)">${data.goals||data.total_goals||0}</div><div class="sl">Goals</div></div>
+      <div class="sc"><div class="sn" style="color:var(--blue)">${(data.snapshots||data.total_snapshots||0).toLocaleString()}</div><div class="sl">Snapshots</div></div>
+      <div class="sc"><div class="sn" style="color:var(--yellow)">${data.obs||data.total_obs||0}</div><div class="sl">Observations</div></div>
       <div class="sc"><div class="sn" style="color:${(data.hit_rate||data.success_rate||0)>=55?'var(--green)':'var(--red)'}">${data.hit_rate||data.success_rate||0}%</div><div class="sl">Hit Rate</div></div>
     </div>
     <div class="tc">

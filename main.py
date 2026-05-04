@@ -242,8 +242,8 @@ def check_rules(conn, mid, home, away, league, minute, sh, sa, period, markets, 
             confidence = min(95, 50+pres//3+(20 if status=="VALIDATED" else 10 if status=="PROMISING" else 0))
 
             try:
-                ex = conn.run("SELECT COUNT(*) FROM trades WHERE mid=:a AND rule_id=:b AND validation_window=:c AND result='pending'",
-                    a=mid, b=rid, c=val_win)
+                ex = conn.run("SELECT COUNT(*) FROM trades WHERE mid=:a AND rule_id=:b AND line=:c AND result='pending'",
+                    a=mid, b=rid, c=line)
                 if ex[0][0] > 0: continue
 
                 conn.run("""INSERT INTO observations

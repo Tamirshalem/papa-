@@ -794,7 +794,10 @@ async function loadRules(){
             <span>🎯 ${r.action_type}</span>
           </div>
         </div>
-        <button class="toggle ${r.is_active?'ton':'toff'}" onclick="toggleRule(${r.id},${!r.is_active})">${r.is_active?'ON':'OFF'}</button>
+        <div style="display:flex;gap:6px">
+          <button class="toggle ${r.is_active?'ton':'toff'}" onclick="toggleRule(${r.id},${!r.is_active})">${r.is_active?'ON':'OFF'}</button>
+          <button onclick="editRule(${JSON.stringify(r).replace(/'/g,'\'').replace(/"/g,'&quot;')})" style="padding:4px 10px;background:rgba(99,179,237,0.15);border:1px solid rgba(99,179,237,0.3);border-radius:6px;color:var(--blue);font-size:11px;cursor:pointer">✏️</button>
+        </div>
       </div>
       <div style="background:var(--bg2);border-radius:8px;padding:10px;margin-top:8px">
         <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;text-align:center;margin-bottom:8px">
@@ -890,7 +893,66 @@ async function runAI(){
   setTimeout(()=>{btn.disabled=false;btn.textContent='🤖 Run Analysis';},3000);
 }
 
+function editRule(r){
+  // Parse rule object
+  let rule = r;
+  if(typeof r === 'string') try{ rule=JSON.parse(r); }catch(e){ return; }
+  
+  // Set form values
+  document.getElementById('ar-name').value = rule.rule_name||'';
+  document.getElementById('ar-rule-id').value = rule.id||'';
+  
+  // mtype
+  document.getElementById('ar-mtype').value = rule.mtype||'FT';
+  
+  // side
+  document.getElementById('ar-side').value = rule.side||'over';
+  
+  // minutes - find closest match
+  const minMin = rule.min_min||0, minMax = rule.min_max||90;
+  const minSel = document.getElementById('ar-minutes');
+  for(let opt of minSel.options){
+    const [a,b] = opt.value.split('-').map(Number);
+    if(Math.abs(a-minMin)<10 && Math.abs(b-minMax)<10){ minSel.value=opt.value; break; }
+  }
+  
+  // odds
+  const ovMin = rule.over_min||rule.under_min||0;
+  const ovMax = rule.over_max||rule.under_max||9.99;
+  const oddSel = document.getElementById('ar-odds');
+  for(let opt of oddSel.options){
+    const [a,b] = opt.value.split('-').map(Number);
+    if(Math.abs(a-ovMin)<0.5){ oddSel.value=opt.value; break; }
+  }
+  
+  // window
+  document.getElementById('ar-window').value = rule.val_window||'10m';
+  
+  // line
+  const lineSel = document.getElementById('ar-line');
+  const lMin = rule.line_min||0.5, lMax = rule.line_max||3.5;
+  for(let opt of lineSel.options){
+    const [a,b] = opt.value.split('-').map(Number);
+    if(Math.abs(a-lMin)<0.1 && Math.abs(b-lMax)<0.1){ lineSel.value=opt.value; break; }
+  }
+  
+  document.getElementById('ar-modal-title').textContent = '✏️ Edit Rule';
+  document.getElementById('ar-save-btn').textContent = '💾 Update Rule';
+  document.getElementById('add-rule-modal').style.display='flex';
+  updatePreview();
+}
+
 function openAddRule(){
+  document.getElementById('ar-rule-id').value = '';
+  document.getElementById('ar-name').value = '';
+  document.getElementById('ar-modal-title').textContent = '➕ Add New Rule';
+  document.getElementById('ar-save-btn').textContent = '💾 Save Rule';
+  document.getElementById('ar-mtype').value = 'FT';
+  document.getElementById('ar-side').value = 'over';
+  document.getElementById('ar-minutes').value = '1-20';
+  document.getElementById('ar-odds').value = '1.60-2.00';
+  document.getElementById('ar-window').value = '10m';
+  document.getElementById('ar-line').value = '1.5-1.5';
   document.getElementById('add-rule-modal').style.display='flex';
   updatePreview();
 }
@@ -921,6 +983,7 @@ setTimeout(()=>{
 async function saveRule(){
   const name=document.getElementById('ar-name').value.trim();
   if(!name){alert('Please enter a rule name');return;}
+  const ruleId=document.getElementById('ar-rule-id').value;
   const mtype=document.getElementById('ar-mtype').value;
   const side=document.getElementById('ar-side').value;
   const [minMin,minMax]=document.getElementById('ar-minutes').value.split('-').map(Number);
@@ -947,10 +1010,12 @@ async function saveRule(){
     action_type:action,
     val_window:win
   };
+  const url = ruleId ? '/api/rules/edit' : '/api/rules/add';
+  if(ruleId) body.id = parseInt(ruleId);
   try{
-    const r=await fetch('/api/rules/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const d=await r.json();
-    if(d.status==='ok'){closeAddRule();loadRules();alert('Rule saved!');}
+    if(d.status==='ok'){closeAddRule();loadRules();}
     else alert('Error: '+d.error);
   }catch(e){alert('Error: '+e.message);}
 }
@@ -1116,6 +1181,32 @@ def api_rules():
         finally: conn.close()
     except: return jsonify([])
 
+@app.route("/api/rules/edit", methods=["POST"])
+def api_rules_edit():
+    try:
+        d=request.json
+        conn=get_db()
+        try:
+            conn.run("""UPDATE rules SET
+                rule_name=:a,description=:b,mtype=:c,
+                line_min=:d,line_max=:e,min_min=:f,min_max=:g,
+                over_min=:h,over_max=:i,under_min=:j,under_max=:k,
+                action_type=:l,side=:m,val_window=:n
+                WHERE id=:o""",
+                a=d["rule_name"],b=d.get("description",""),c=d.get("mtype","FT"),
+                d=d.get("line_min",0.5),e=d.get("line_max",3.5),
+                f=d.get("min_min",0),g=d.get("min_max",90),
+                h=d.get("over_min"),i=d.get("over_max"),
+                j=d.get("under_min"),k=d.get("under_max"),
+                l=d.get("action_type","OVER_LINE_WITHIN_10M"),
+                m=d.get("side","over"),n=d.get("val_window","10m"),
+                o=d["id"])
+            return jsonify({"status":"ok"})
+        finally: conn.close()
+    except Exception as e:
+        log.error(f"Edit rule: {e}")
+        return jsonify({"error":str(e)}),500
+
 @app.route("/api/rules/add", methods=["POST"])
 def api_rules_add():
     try:
@@ -1274,6 +1365,80 @@ Be honest about data limitations. Say 'insufficient data' for specific claims ne
         return jsonify({"error":str(e)}),500
 
 @app.route("/api/ai_rules", methods=["POST"])
+def api_ai_rules():
+    if not ANTHROPIC_API_KEY: return jsonify({"error":"No API key"}),400
+    try:
+        data_req = request.get_json(silent=True) or {}
+        user_instruction = data_req.get("instruction","")
+        conn=get_db()
+        try:
+            goals=conn.run("SELECT minute,period,score_before FROM goals ORDER BY goal_time DESC LIMIT 200")
+            rules=conn.run("SELECT rule_name,total_signals,wins,losses,win_rate FROM rules ORDER BY total_signals DESC")
+            obs=conn.run("SELECT minute,mtype,line,over_odd,under_odd FROM observations ORDER BY detected_at DESC LIMIT 200")
+
+            minute_dist = {}
+            for g in goals:
+                if g[0]:
+                    bucket = (g[0]//5)*5
+                    minute_dist[bucket] = minute_dist.get(bucket,0)+1
+
+            json_example = ('{"new_rules":[{"rule_name":"name","description":"desc","mtype":"FT",'
+                           '"line_min":0.5,"line_max":2.5,"min_min":17,"min_max":20,'
+                           '"over_min":1.50,"over_max":1.60,"under_min":null,"under_max":null,'
+                           '"held_min":0,"action_type":"OVER_LINE_WITHIN_10M","side":"over","val_window":"10m"}],'
+                           '"insights":"2 sentences"}')
+
+            default_instr = "Find patterns at key minutes (18,30,78,84,85+). Stable odds at 1.5 or 2.5 for 1-2min = goal. Fast rising = no goal."
+            instr = user_instruction if user_instruction else default_instr
+
+            prompt = (
+                "You are PapaGoal AI. Find Over/Under mispricings in football.\n\n"
+                "PATTERNS TO FIND:\n"
+                "1. Stable odds (1.5 or 2.5) for 1-2min = goal imminent -> OVER\n"
+                "2. Fast rising odds = no goal -> UNDER\n"
+                "3. Key minutes: 18, 30, 45, 78, 84, 85+\n\n"
+                "Actions: OVER_LINE_WITHIN_5M, OVER_LINE_WITHIN_10M, OVER_LINE_WITHIN_15M, "
+                "H1_OVER_LINE_BEFORE_HT, UNDER_HOLDS_10M, UNDER_HOLDS_TO_HT, OVER_LINE_BEFORE_FT\n"
+                "mtype: FT=full match, H1=first half. val_window: 5m,10m,15m,HT,FT\n\n"
+                f"Goals: {len(goals)} total. Distribution: {dict(sorted(minute_dist.items()))}\n"
+                f"Rules: {[(r[0],r[2],r[3],str(r[4])+'%') for r in rules]}\n"
+                f"Odds sample (min,mtype,line,over,under): {[(o[0],o[1],o[2],o[3],o[4]) for o in obs[:20]]}\n\n"
+                f"Request: {instr}\n\n"
+                f"Suggest 1-2 rules. Return ONLY JSON: {json_example}"
+            )
+            resp=requests.post("https://api.anthropic.com/v1/messages",
+                headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"},
+                json={"model":"claude-sonnet-4-5","max_tokens":1000,"messages":[{"role":"user","content":prompt}]},timeout=30)
+            if resp.status_code==200:
+                text=resp.json()["content"][0]["text"]
+                text=re.sub(r'```json\s*','',text)
+                text=re.sub(r'```\s*','',text)
+                m=re.search(r'\{.*\}',text,re.DOTALL)
+                if m:
+                    try: data=json.loads(m.group())
+                    except:
+                        m2=re.search(r'"new_rules"\s*:\s*(\[.*?\])',text,re.DOTALL)
+                        data={"new_rules":json.loads(m2.group(1))} if m2 else {"new_rules":[]}
+                    count=0
+                    for nr in data.get("new_rules",[]):
+                        try:
+                            conn.run("""INSERT INTO rules (rule_name,description,source,mtype,line_min,line_max,min_min,min_max,
+                                over_min,over_max,under_min,under_max,held_min,action_type,side,val_window,status,is_active)
+                                VALUES (:a,:b,'ai',:c,:d,:e,:f,:g,:h,:i,:j,:k,:l,:m,:n,:o,'AI_HYPOTHESIS',FALSE)
+                                ON CONFLICT DO NOTHING""",
+                                a=nr["rule_name"],b=nr.get("description",""),c=nr.get("mtype","FT"),
+                                d=nr.get("line_min",0.5),e=nr.get("line_max",3.5),f=nr.get("min_min",0),g=nr.get("min_max",90),
+                                h=nr.get("over_min"),i=nr.get("over_max"),j=nr.get("under_min"),k=nr.get("under_max"),
+                                l=nr.get("held_min",0),m=nr.get("action_type","OVER_LINE_WITHIN_10M"),
+                                n=nr.get("side","over"),o=nr.get("val_window","10m"))
+                            count+=1
+                        except: pass
+                    return jsonify({"status":"ok","new_rules":count})
+            return jsonify({"error":f"Claude {resp.status_code}"}),500
+        finally: conn.close()
+    except Exception as e: return jsonify({"error":str(e)}),500
+
+
 def api_ai_rules():
     if not ANTHROPIC_API_KEY: return jsonify({"error":"No API key"}),400
     try:

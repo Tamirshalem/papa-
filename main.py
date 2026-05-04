@@ -834,7 +834,7 @@ async function loadAnalytics(){
       <div class="sc"><div class="sn" style="color:var(--green)">${data.total_goals||0}</div><div class="sl">Goals</div></div>
       <div class="sc"><div class="sn" style="color:var(--blue)">${(data.total_snapshots||0).toLocaleString()}</div><div class="sl">Snapshots</div></div>
       <div class="sc"><div class="sn" style="color:var(--yellow)">${data.total_obs||0}</div><div class="sl">Observations</div></div>
-      <div class="sc"><div class="sn" style="color:${(data.success_rate||0)>=55?'var(--green)':'var(--red)'}">${data.success_rate||0}%</div><div class="sl">Hit Rate</div></div>
+      <div class="sc"><div class="sn" style="color:${(data.hit_rate||data.success_rate||0)>=55?'var(--green)':'var(--red)'}">${data.hit_rate||data.success_rate||0}%</div><div class="sl">Hit Rate</div></div>
     </div>
     <div class="tc">
       <div class="card">
@@ -851,8 +851,8 @@ async function loadAnalytics(){
         <div class="stit">Top Rules by Signals</div>
         ${(data.top_rules||[]).map(r=>`
           <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);font-size:13px">
-            <span style="color:var(--muted)">${r.rule_name}</span>
-            <span style="color:var(--blue);font-family:'JetBrains Mono',monospace">${r.cnt} signals</span>
+            <span style="color:var(--muted)">${r.name||r.rule_name||'?'}</span>
+            <span style="color:var(--blue);font-family:'JetBrains Mono',monospace">${r.cnt||r.total_signals||0} signals</span>
           </div>`).join('')}
       </div>
     </div>`;

@@ -1019,8 +1019,9 @@ def api_rules_toggle():
         log.info(f"Toggle: {data}")
         conn=get_db()
         try:
+            rule_id = data.get("id") or data.get("rule_name")
             conn.run("UPDATE rules SET is_active=:a WHERE id=:b",
-                a=data["is_active"],b=data["id"])
+                a=data["is_active"], b=rule_id)
             return jsonify({"status":"ok"})
         finally: conn.close()
     except Exception as e:

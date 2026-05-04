@@ -699,11 +699,11 @@ async function loadObs(){
   el.innerHTML=obs.map(o=>`
     <div class="card">
       <div class="ctop">
-        <div><div class="mn">${o.home_team} vs ${o.away_team}</div>
+        <div><div class="mn">${o.home||o.home_team||'?'} vs ${o.away||o.away_team||'?'}</div>
         <div class="ml">${o.rule_name} · ${o.league||''}</div></div>
         <div class="bgs">
           ${o.minute>0?`<span class="bg bgb">⏱ ${o.minute}'</span>`:''}
-          <span class="bg bgy">${o.market_type} ${o.line}</span>
+          <span class="bg bgy">${o.mtype||o.market_type||'FT'} ${o.line||''}</span>
           <span class="bg bgp">${o.action_type}</span>
         </div>
       </div>
@@ -711,8 +711,8 @@ async function loadObs(){
         <div class="ot"><div class="ol">OVER</div><div class="ov">${o.over_odd||'—'}</div></div>
         <div class="ot"><div class="ol">EXPECTED</div><div class="ov">${o.expected_odd||'—'}</div></div>
         <div class="ot"><div class="ol">GAP</div><div class="ov" style="color:var(--blue)">${o.gap||0}</div></div>
-        <div class="ot"><div class="ol">PRESSURE</div><div class="ov">${o.pressure_score||0}%</div></div>
-        <div class="ot"><div class="ol">CONF</div><div class="ov">${o.confidence_estimate||50}%</div></div>
+        <div class="ot"><div class="ol">PRESSURE</div><div class="ov">${o.pressure||o.pressure_score||0}%</div></div>
+        <div class="ot"><div class="ol">CONF</div><div class="ov">${o.confidence||o.confidence_estimate||50}%</div></div>
       </div>
       <div style="font-size:12px;color:var(--muted)">${o.reason||''}</div>
     </div>`).join('');

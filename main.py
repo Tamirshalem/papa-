@@ -6,6 +6,7 @@ import pg8000.native
 import requests
 
 ODDSAPI_KEY       = os.environ.get("ODDSAPI_KEY", "")
+APIFOOTBALL_KEY   = os.environ.get("APIFOOTBALL_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 DATABASE_URL      = os.environ.get("DATABASE_URL", "")
 PORT              = int(os.environ.get("PORT", 8080))
@@ -136,6 +137,26 @@ def init_db():
         conn.run("""CREATE TABLE IF NOT EXISTS insights (
             id SERIAL PRIMARY KEY, created_at TIMESTAMPTZ DEFAULT NOW(),
             itype TEXT, content TEXT, goals_n INT DEFAULT 0, rules_n INT DEFAULT 0)""")
+        conn.run("""CREATE TABLE IF NOT EXISTS match_stats (
+            id SERIAL PRIMARY KEY,
+            mid TEXT NOT NULL,
+            minute INT,
+            dangerous_attacks_home INT DEFAULT 0,
+            dangerous_attacks_away INT DEFAULT 0,
+            shots_home INT DEFAULT 0,
+            shots_away INT DEFAULT 0,
+            possession_home INT DEFAULT 0,
+            saved_at TIMESTAMPTZ DEFAULT NOW())""")
+        conn.run("CREATE INDEX IF NOT EXISTS idx_stats_mid ON match_stats(mid,saved_at DESC)")
+        conn.run("""CREATE TABLE IF NOT EXISTS key_minutes (
+            id SERIAL PRIMARY KEY,
+            mid TEXT NOT NULL,
+            minute INT NOT NULL,
+            score_home INT, score_away INT,
+            over_ft NUMERIC, under_ft NUMERIC,
+            dangerous_attacks_home INT, dangerous_attacks_away INT,
+            saved_at TIMESTAMPTZ DEFAULT NOW(),
+            UNIQUE(mid, minute))""")
         conn.run("""CREATE TABLE IF NOT EXISTS odds_snapshots (
             id SERIAL PRIMARY KEY,
             mid TEXT NOT NULL,
@@ -256,6 +277,70 @@ def parse_event(event):
             "minute":minute,"score_h":score_h,"score_a":score_a,
             "period":period,"total":score_h+score_a}
 
+def fetch_match_stats(fixture_id):
+    """Fetch live stats from api-football"""
+    if not APIFOOTBALL_KEY: return None
+    try:
+        r = requests.get("https://v3.football.api-sports.io/fixtures/statistics",
+            headers={"x-apisports-key": APIFOOTBALL_KEY},
+            params={"fixture": fixture_id},
+            timeout=5)
+        if r.status_code != 200: return None
+        data = r.json()
+        teams = data.get("response", [])
+        stats = {"dangerous_attacks_home":0,"dangerous_attacks_away":0,
+                 "shots_home":0,"shots_away":0,"possession_home":50}
+        for i, team in enumerate(teams[:2]):
+            prefix = "home" if i==0 else "away"
+            for s in team.get("statistics",[]):
+                stype = s.get("type","").lower()
+                val = s.get("value") or 0
+                try: val = int(str(val).replace("%",""))
+                except: val = 0
+                if "dangerous" in stype: stats[f"dangerous_attacks_{prefix}"] = val
+                elif "shots on" in stype: stats[f"shots_{prefix}"] = val
+                elif "possession" in stype and prefix=="home": stats["possession_home"] = val
+        return stats
+    except Exception as e:
+        log.debug(f"Stats error: {e}")
+        return None
+
+def get_apifootball_id(home, away):
+    """Find api-football fixture id by team names"""
+    if not APIFOOTBALL_KEY: return None
+    try:
+        r = requests.get("https://v3.football.api-sports.io/fixtures",
+            headers={"x-apisports-key": APIFOOTBALL_KEY},
+            params={"live":"all","search":home[:10]},
+            timeout=5)
+        if r.status_code != 200: return None
+        for fix in r.json().get("response",[]):
+            h = fix.get("teams",{}).get("home",{}).get("name","").lower()
+            a = fix.get("teams",{}).get("away",{}).get("name","").lower()
+            if home[:5].lower() in h or away[:5].lower() in a:
+                return fix.get("fixture",{}).get("id")
+    except: pass
+    return None
+
+def get_odds_velocity(conn, mid, mtype, line, current_over):
+    """Calculate how fast odds are moving -- key signal"""
+    try:
+        snaps = conn.run("""SELECT over_odd, saved_at FROM odds_snapshots
+            WHERE mid=:a AND mtype=:b AND line=:c
+            ORDER BY saved_at DESC LIMIT 4""",
+            a=mid, b=mtype, c=line)
+        if len(snaps) < 2: return 0, "stable"
+        oldest = float(snaps[-1][0]) if snaps[-1][0] else None
+        if not oldest or not current_over: return 0, "stable"
+        velocity = round(current_over - oldest, 3)
+        if velocity > 0.15: direction = "rising_fast"   # market giving up
+        elif velocity > 0.05: direction = "rising"
+        elif velocity < -0.15: direction = "dropping_fast"  # goal expected
+        elif velocity < -0.05: direction = "dropping"
+        else: direction = "stable"  # strongest signal!
+        return velocity, direction
+    except: return 0, "stable"
+
 def save_opening_odds(conn, mid, home, away, league, markets):
     """Save opening odds for a match -- only saves once per mid+mtype+line"""
     saved = 0
@@ -271,7 +356,7 @@ def save_opening_odds(conn, mid, home, away, league, markets):
         except Exception as e:
             log.debug(f"Opening odds: {e}")
     if saved > 0:
-        log.info(f"[SAVE] Opening odds saved: {home} vs {away} -- {saved} markets")
+        log.info(f"💾 Opening odds saved: {home} vs {away} -- {saved} markets")
 
 def get_opening(conn, mid, mtype, line):
     """Get opening odds for a specific market"""
@@ -390,7 +475,7 @@ def check_rules(conn, mid, home, away, league, minute, sh, sa, period, markets, 
                     o=score_str,p=gap,q=pres,r=val_win)
 
                 conn.run("UPDATE rules SET total_signals=total_signals+1,updated_at=NOW() WHERE id=:a", a=rid)
-                log.info(f"[SIGNAL] SIGNAL: {rname} | {home} vs {away} | {mtype}{line} {side}@{entry_odd} min:{minute}")
+                log.info(f"🎯 SIGNAL: {rname} | {home} vs {away} | {mtype}{line} {side}@{entry_odd} min:{minute}")
             except Exception as e:
                 log.debug(f"Signal: {e}")
 
@@ -441,7 +526,7 @@ def validate_trades(conn):
             elif elapsed>35: result,fail="lose","FT timeout"
         if result:
             profit = round((float(entry_odd or 1)-1)*100,2) if result=="win" else -100.0
-            emoji = "[WIN] WIN" if result=="win" else "[LOSE] LOSE"
+            emoji = "✅ WIN" if result=="win" else "❌ LOSE"
             log.info(f"{emoji} | {action} | {side}@{entry_odd} | {fail or 'resolved'} | P&L: ?{profit:+.0f}")
             try:
                 conn.run("""UPDATE trades SET result=:a,resolved_at=NOW(),profit=:b,fail_reason=:c WHERE id=:d""",
@@ -492,7 +577,7 @@ def collect():
 
                 # Fetch odds from Bet365
                 markets = []
-                log.info(f"[FETCH] Fetching odds for {p['home']} vs {p['away']} (eid:{p['eid']})")
+                log.info(f"🔍 Fetching odds for {p['home']} vs {p['away']} (eid:{p['eid']})")
                 try:
                     for bk in ["Bet365","Sbobet","1xbet","Unibet","Betfair Sportsbook"]:
                         r_odds = requests.get("https://api.odds-api.io/v3/odds",
@@ -518,10 +603,10 @@ def collect():
                                     if k not in opening_cache:
                                         opening_cache[k] = {"over":over,"under":under}
                         if markets:
-                            log.info(f"[ODDS] Odds: {p['home']} vs {p['away']} -- {len(markets)} markets [{bk}]")
+                            log.info(f"📊 Odds: {p['home']} vs {p['away']} -- {len(markets)} markets [{bk}]")
                             break
                 except Exception as oe:
-                    log.warning(f"[ODDS] Odds error: {oe}")
+                    log.warning(f"📊 Odds error: {oe}")
 
                 if markets:
                     # Always save opening odds (first time only)
@@ -535,6 +620,37 @@ def collect():
                                 a=mid,b=p["minute"],c=mkt["mtype"],
                                 d=mkt["line"],e=mkt.get("over"),f=mkt.get("under"))
                         except: pass
+                    # Save key minutes (70, 75, 80, 85, 90)
+                    cur_min = p["minute"]
+                    if cur_min in (70,75,80,85,90):
+                        ft_snap = next((m for m in markets if m["mtype"]=="FT" and m["line"]==2.5),None)
+                        try:
+                            conn.run("""INSERT INTO key_minutes 
+                                (mid,minute,score_home,score_away,over_ft,under_ft)
+                                VALUES (:a,:b,:c,:d,:e,:f)
+                                ON CONFLICT (mid,minute) DO NOTHING""",
+                                a=mid,b=cur_min,c=p["score_h"],d=p["score_a"],
+                                e=ft_snap.get("over") if ft_snap else None,
+                                f=ft_snap.get("under") if ft_snap else None)
+                        except: pass
+                    # Fetch dangerous attacks from api-football (every ~60s to save quota)
+                    if APIFOOTBALL_KEY and cur_min % 2 == 0:
+                        fid = get_apifootball_id(p["home"],p["away"])
+                        if fid:
+                            stats = fetch_match_stats(fid)
+                            if stats:
+                                try:
+                                    conn.run("""INSERT INTO match_stats 
+                                        (mid,minute,dangerous_attacks_home,dangerous_attacks_away,
+                                        shots_home,shots_away,possession_home)
+                                        VALUES (:a,:b,:c,:d,:e,:f,:g)""",
+                                        a=mid,b=cur_min,
+                                        c=stats["dangerous_attacks_home"],
+                                        d=stats["dangerous_attacks_away"],
+                                        e=stats["shots_home"],f=stats["shots_away"],
+                                        g=stats["possession_home"])
+                                    log.debug(f"Stats saved: {p['home']} DA={stats['dangerous_attacks_home']}/{stats['dangerous_attacks_away']}")
+                                except: pass
                     # Run rules
                     check_rules(conn,mid,p["home"],p["away"],p["league"],
                                p["minute"],p["score_h"],p["score_a"],p["period"],
@@ -640,14 +756,14 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;min-h
 <div class="sidebar">
   <div class="logo"><div class="logo-main">PAPA<span>GOAL</span></div><div class="logo-sub">READ THE MARKET</div></div>
   <nav class="nav">
-    <button class="nav-item active" onclick="show('live',this)"><span>?</span><span>Live Dashboard</span></button>
-    <button class="nav-item" onclick="show('goals',this)"><span>[GOAL]</span><span>Goals</span></button>
-    <button class="nav-item" onclick="show('trades',this)"><span>?</span><span>Simulation</span></button>
-    <button class="nav-item" onclick="show('obs',this)"><span>?</span><span>Observations</span></button>
-    <button class="nav-item" onclick="show('rules',this)"><span>?</span><span>Rules Engine</span></button>
-    <button class="nav-item" onclick="show('analytics',this)"><span>[ODDS]</span><span>Analytics</span></button>
-    <button class="nav-item" onclick="show('ai',this)"><span>[AI]</span><span>AI Insights</span></button>
-    <button class="nav-item" onclick="show('debug',this)"><span>?</span><span>API Debug</span></button>
+    <button class="nav-item active" onclick="show('live',this)"><span>📡</span><span>Live Dashboard</span></button>
+    <button class="nav-item" onclick="show('goals',this)"><span>⚽</span><span>Goals</span></button>
+    <button class="nav-item" onclick="show('trades',this)"><span>📈</span><span>Simulation</span></button>
+    <button class="nav-item" onclick="show('obs',this)"><span>🔥</span><span>Observations</span></button>
+    <button class="nav-item" onclick="show('rules',this)"><span>📋</span><span>Rules Engine</span></button>
+    <button class="nav-item" onclick="show('analytics',this)"><span>📊</span><span>Analytics</span></button>
+    <button class="nav-item" onclick="show('ai',this)"><span>🤖</span><span>AI Insights</span></button>
+    <button class="nav-item" onclick="show('debug',this)"><span>🔧</span><span>API Debug</span></button>
   </nav>
 </div>
 <div class="main">
@@ -660,15 +776,15 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;min-h
     <div class="sc"><div class="sn" style="color:var(--yellow)" id="sg">--</div><div class="sl">Goals Today</div></div>
     <div class="sc"><div class="sn" style="color:var(--purple)" id="st">--</div><div class="sl">Open Trades</div></div>
   </div>
-  <div class="stit">[SIGNAL] Active Recommendations</div>
-  <div id="live-cards"><div class="empty"><div style="font-size:42px">[GOAL]</div><div>No active signals -- waiting for live matches</div></div></div>
+  <div class="stit">🎯 Active Recommendations</div>
+  <div id="live-cards"><div class="empty"><div style="font-size:42px">⚽</div><div>No active signals -- waiting for live matches</div></div></div>
   <div class="stit" style="margin-top:20px">? All Live Matches</div>
   <div id="all-matches"><div class="empty" style="padding:20px">Loading matches...</div></div>
 </div>
 
 <div class="page" id="p-goals">
-  <div class="ph"><div><div class="pt">[GOAL] Goals Detected</div><div class="ps">Odds before each goal - core learning data</div></div></div>
-  <div id="goals-list"><div class="empty"><div style="font-size:42px">[GOAL]</div><div>Loading goals...</div></div></div>
+  <div class="ph"><div><div class="pt">⚽ Goals Detected</div><div class="ps">Odds before each goal - core learning data</div></div></div>
+  <div id="goals-list"><div class="empty"><div style="font-size:42px">⚽</div><div>Loading goals...</div></div></div>
 </div>
 
 <div class="page" id="p-trades">
@@ -684,7 +800,7 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;min-h
 <div class="page" id="p-rules">
   <div class="ph">
     <div><div class="pt">? Rules Engine</div><div class="ps">Rule lifecycle ? hit rates ? AI suggestions</div></div>
-    <button class="abtn" onclick="runAIRules()" id="ai-rules-btn">[AI] AI: Improve Rules</button>
+    <button class="abtn" onclick="runAIRules()" id="ai-rules-btn">🤖 AI: Improve Rules</button>
   </div>
   <div class="sr">
     <div class="sc"><div class="sn" style="color:var(--green)" id="ra">--</div><div class="sl">Active Rules</div></div>
@@ -696,16 +812,16 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;min-h
 </div>
 
 <div class="page" id="p-analytics">
-  <div class="ph"><div><div class="pt">[ODDS] Analytics</div><div class="ps">Pattern analysis & performance metrics</div></div></div>
-  <div id="analytics-content"><div class="empty"><div style="font-size:42px">[ODDS]</div><div>Loading...</div></div></div>
+  <div class="ph"><div><div class="pt">📊 Analytics</div><div class="ps">Pattern analysis & performance metrics</div></div></div>
+  <div id="analytics-content"><div class="empty"><div style="font-size:42px">📊</div><div>Loading...</div></div></div>
 </div>
 
 <div class="page" id="p-ai">
   <div class="ph">
-    <div><div class="pt">[AI] AI Insights</div><div class="ps">Claude analyzes patterns & suggests rules</div></div>
-    <button class="abtn" onclick="runAI()" id="ai-btn">[AI] Run Analysis</button>
+    <div><div class="pt">🤖 AI Insights</div><div class="ps">Claude analyzes patterns & suggests rules</div></div>
+    <button class="abtn" onclick="runAI()" id="ai-btn">🤖 Run Analysis</button>
   </div>
-  <div id="ai-content"><div class="empty"><div style="font-size:42px">[AI]</div><div>Click Run Analysis to get insights</div></div></div>
+  <div id="ai-content"><div class="empty"><div style="font-size:42px">🤖</div><div>Click Run Analysis to get insights</div></div></div>
 </div>
 
 <div class="page" id="p-debug">
@@ -747,14 +863,14 @@ async function loadLive(){
     const aiMap={};ai.forEach(a=>aiMap[a.match_id]=a.analysis);
     const el=document.getElementById('live-cards');
     if(!obs.length){
-      el.innerHTML='<div class="empty"><div style="font-size:36px">[WIN]</div><div>No active signals yet</div></div>';
+      el.innerHTML='<div class="empty"><div style="font-size:36px">✅</div><div>No active signals yet</div></div>';
     } else {
       const bm={};
       obs.forEach(o=>{if(!bm[o.match_id]) bm[o.match_id]={...o,signals:[]};bm[o.match_id].signals.push(o);});
       el.innerHTML=Object.values(bm).map(m=>{
-        const ai=aiMap[m.match_id]?`<div style="background:rgba(59,130,246,0.06);border:1px solid rgba(59,130,246,0.2);border-radius:8px;padding:10px;margin-top:8px;font-size:13px;line-height:1.6;color:#94a3b8"><div style="font-size:10px;letter-spacing:2px;color:var(--blue);margin-bottom:4px">[AI] CLAUDE AI</div>${aiMap[m.match_id]}</div>`:'';
+        const ai=aiMap[m.match_id]?`<div style="background:rgba(59,130,246,0.06);border:1px solid rgba(59,130,246,0.2);border-radius:8px;padding:10px;margin-top:8px;font-size:13px;line-height:1.6;color:#94a3b8"><div style="font-size:10px;letter-spacing:2px;color:var(--blue);margin-bottom:4px">🤖 CLAUDE AI</div>${aiMap[m.match_id]}</div>`:'';
         const sigs=m.signals.map(s=>`<div class="rec-box">
-          <div class="rec-title">[SIGNAL] ${s.action_type} ? ${s.rule_name}</div>
+          <div class="rec-title">🎯 ${s.action_type} ? ${s.rule_name}</div>
           <div class="rec-row">
             <span>Market: <span class="rec-val">${s.market_type} ${s.line}</span></span>
             <span>Side: <span class="rec-val">${(s.selected_side||'').toUpperCase()}</span></span>
@@ -770,7 +886,7 @@ async function loadLive(){
             <div class="bgs">
               ${m.minute>0?`<span class="bg bgb">? ${m.minute}'</span>`:''}
               ${m.score&&m.score!='0-0'?`<span class="bg bgy">${m.score}</span>`:''}
-              <span class="bg bgg">[SIGNAL] SIGNAL</span>
+              <span class="bg bgg">🎯 SIGNAL</span>
             </div>
           </div>${sigs}${ai}</div>`;
       }).join('');
@@ -778,7 +894,7 @@ async function loadLive(){
     // Show all matches
     const mel=document.getElementById('all-matches');
     if(!matches.length){
-      mel.innerHTML='<div style="color:var(--muted);font-size:13px;padding:20px;text-align:center">[GOAL] No live matches right now -- check back when European leagues are playing (afternoons)</div>';
+      mel.innerHTML='<div style="color:var(--muted);font-size:13px;padding:20px;text-align:center">⚽ No live matches right now -- check back when European leagues are playing (afternoons)</div>';
     } else {
       mel.innerHTML='<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:8px">'+
         matches.map(m=>`<div class="card" style="padding:12px;cursor:pointer" onclick="toggleMatchOdds('${m.mid}',this)">
@@ -790,7 +906,7 @@ async function loadLive(){
             <span class="bg ${m.period==='H1'?'bgb':m.period==='H2'?'bgp':'bgg'}">${m.period}</span>
           </div>
           <div class="match-odds-panel" style="display:none;margin-top:8px;border-top:1px solid var(--border);padding-top:8px">
-            <div style="font-size:10px;color:var(--muted);margin-bottom:4px">[ODDS] Opening Odds</div>
+            <div style="font-size:10px;color:var(--muted);margin-bottom:4px">📊 Opening Odds</div>
             <div class="odds-loading" style="font-size:11px;color:var(--muted)">Loading...</div>
           </div>
         </div>`).join('')+'</div>';
@@ -824,7 +940,7 @@ async function toggleMatchOdds(mid, card){
 async function loadGoals(){
   const goals=await fetch('/api/goals').then(r=>r.json()).catch(()=>[]);
   const el=document.getElementById('goals-list');
-  if(!goals.length){el.innerHTML='<div class="empty"><div style="font-size:42px">[GOAL]</div><div>No goals yet</div></div>';return;}
+  if(!goals.length){el.innerHTML='<div class="empty"><div style="font-size:42px">⚽</div><div>No goals yet</div></div>';return;}
   el.innerHTML=goals.map(g=>{
     const snap30 = g.odds_30s||[];
     const snap60 = g.odds_60s||[];
@@ -841,7 +957,7 @@ async function loadGoals(){
     return `<div class="card win">
       <div class="ctop">
         <div><div class="mn">${g.home||g.home_team||'?'} vs ${g.away||g.away_team||'?'}</div><div class="ml">${g.league||''} ? ${g.period||'FT'}</div></div>
-        <div style="font-size:16px;font-weight:700;font-family:'JetBrains Mono',monospace;color:var(--green)">[GOAL] Min ${g.minute}</div>
+        <div style="font-size:16px;font-weight:700;font-family:'JetBrains Mono',monospace;color:var(--green)">⚽ Min ${g.minute}</div>
       </div>
       <div style="font-size:12px;color:var(--muted);margin-bottom:8px">${g.score_before||'?'} ? ${g.score_after||'?'}</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
@@ -870,15 +986,15 @@ async function loadTrades(){
   el.innerHTML=`
     <div class="sr">
       <div class="sc"><div class="sn" style="color:var(--yellow)">${pend.length}</div><div class="sl">? Pending</div></div>
-      <div class="sc"><div class="sn" style="color:var(--green)">${wins.length}</div><div class="sl">[WIN] Win</div></div>
-      <div class="sc"><div class="sn" style="color:var(--red)">${lose.length}</div><div class="sl">[LOSE] Lose</div></div>
+      <div class="sc"><div class="sn" style="color:var(--green)">${wins.length}</div><div class="sl">✅ Win</div></div>
+      <div class="sc"><div class="sn" style="color:var(--red)">${lose.length}</div><div class="sl">❌ Lose</div></div>
       <div class="sc"><div class="sn" style="color:${profit>=0?'var(--green)':'var(--red)'}">${pct}% ? ?${profit.toFixed(0)}</div><div class="sl">Hit Rate ? P&L</div></div>
     </div>
     <div class="stit">All Trades (${trades.length})</div>
     ${!trades.length?'<div class="empty"><div style="font-size:42px">?</div><div>No trades yet</div></div>':
       trades.map(t=>{
         const rc=t.result==='pending'?'bgy':t.result==='win'?'bgg':'bgr';
-        const rl=t.result==='pending'?'? PENDING':t.result==='win'?'[WIN] WIN':'[LOSE] LOSE';
+        const rl=t.result==='pending'?'? PENDING':t.result==='win'?'✅ WIN':'❌ LOSE';
         const bc=t.result==='pending'?'var(--yellow)':t.result==='win'?'var(--green)':'var(--red)';
         return `<div class="card" style="border-color:${bc}33">
           <div class="ctop">
@@ -896,7 +1012,7 @@ async function loadTrades(){
             <div class="ot"><div class="ol">PRESSURE</div><div class="ov">${t.pressure||t.pressure_score||0}%</div></div>
             ${t.result!=='pending'?`<div class="ot"><div class="ol">P&L</div><div class="ov" style="color:${(t.profit||t.dummy_profit_loss||0)>=0?'var(--green)':'var(--red)'}">?${(t.profit||t.dummy_profit_loss||0).toFixed(0)}</div></div>`:''}
           </div>
-          <div style="font-size:11px;color:var(--muted)">${(()=>{const m={'OVER_LINE_WITHIN_10M':'[SIGNAL] Goal in 10min','OVER_LINE_WITHIN_5M':'[SIGNAL] Goal in 5min','UNDER_HOLDS_10M':'[SHIELD] No goal 10min','H1_OVER_LINE_BEFORE_HT':'[SIGNAL] Goal before HT','UNDER_HOLDS_TO_HT':'[SHIELD] No goal to HT','OVER_LINE_BEFORE_FT':'[SIGNAL] Goal before FT','OVER_LINE_WITHIN_15M':'[SIGNAL] Goal in 15min'};return m[t.action_type]||t.action_type;})()} ? Window: ${t.val_window||'10m'} ? Score: ${t.score_entry||'--'}</div>
+          <div style="font-size:11px;color:var(--muted)">${(()=>{const m={'OVER_LINE_WITHIN_10M':'🎯 Goal in 10min','OVER_LINE_WITHIN_5M':'🎯 Goal in 5min','UNDER_HOLDS_10M':'🛡 No goal 10min','H1_OVER_LINE_BEFORE_HT':'🎯 Goal before HT','UNDER_HOLDS_TO_HT':'🛡 No goal to HT','OVER_LINE_BEFORE_FT':'🎯 Goal before FT','OVER_LINE_WITHIN_15M':'🎯 Goal in 15min'};return m[t.action_type]||t.action_type;})()} ? Window: ${t.val_window||'10m'} ? Score: ${t.score_entry||'--'}</div>
           ${(t.fail_reason||t.failure_reason)?`<div style="font-size:11px;color:var(--red);margin-top:4px">${t.fail_reason||t.failure_reason}</div>`:""}
         </div>`;
       }).join('')}`;
@@ -954,17 +1070,17 @@ async function loadRules(){
       <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;gap:8px">
         <div style="flex:1">
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;flex-wrap:wrap">
-            <span style="font-size:14px;font-weight:700;color:${r.is_active?'var(--text)':'var(--muted)'}">${r.source==='ai'?'[AI] ':'? '}${r.rule_name}</span>
+            <span style="font-size:14px;font-weight:700;color:${r.is_active?'var(--text)':'var(--muted)'}">${r.source==='ai'?'🤖 ':'? '}${r.rule_name}</span>
             <span class="status-badge ${statusClass[r.status]||'s-active'}">${r.status}</span>
             <span style="font-size:11px;font-weight:700;color:${sideColor};font-family:'JetBrains Mono',monospace">${sideLabel}</span>
           </div>
           <div style="font-size:11px;color:var(--muted);margin-bottom:6px">${r.description||''}</div>
           <div style="font-size:10px;color:var(--muted);font-family:'JetBrains Mono',monospace;display:flex;gap:12px;flex-wrap:wrap">
-            <span>? min ${r.min_min||r.minute_min||"?"}-${r.min_max||r.minute_max||"?"}</span>
-            <span>[ODDS] ${r.mtype||r.market_type||"FT"} ${r.line_min||"?"}-${r.line_max||"?"}</span>
+            <span>? min ${r.min_min||r.minute_min||"🏠"}-${r.min_max||r.minute_max||"🏠"}</span>
+            <span>📊 ${r.mtype||r.market_type||"FT"} ${r.line_min||"🏠"}-${r.line_max||"🏠"}</span>
             <span>? ${oddRange}</span>
-            <span>? window: ${r.val_window||r.validation_window||"?"}</span>
-            <span>[SIGNAL] ${r.action_type}</span>
+            <span>? window: ${r.val_window||r.validation_window||"🏠"}</span>
+            <span>🎯 ${r.action_type}</span>
           </div>
         </div>
         <div style="display:flex;gap:6px">
@@ -996,14 +1112,14 @@ async function toggleRule(name,state){
 
 async function runAIRules(){
   const btn=document.getElementById('ai-rules-btn');
-  btn.disabled=true;btn.textContent='[AI] Analyzing...';
+  btn.disabled=true;btn.textContent='🤖 Analyzing...';
   try{
     const r=await fetch('/api/ai_rules',{method:'POST'});
     const d=await r.json();
     if(d.error)alert('Error: '+d.error);
     else{alert(`AI done! ${d.new_rules||0} new rule suggestions added.`);loadRules();}
   }catch(e){alert('Error');}
-  btn.disabled=false;btn.textContent='[AI] AI: Improve Rules';
+  btn.disabled=false;btn.textContent='🤖 AI: Improve Rules';
 }
 
 async function loadAnalytics(){
@@ -1047,7 +1163,7 @@ async function loadAnalytics(){
 async function loadAI(){
   const ins=await fetch('/api/insights').then(r=>r.json()).catch(()=>[]);
   const el=document.getElementById('ai-content');
-  if(!ins.length){el.innerHTML='<div class="empty"><div style="font-size:42px">[AI]</div><div>Click Run Analysis to get insights</div></div>';return;}
+  if(!ins.length){el.innerHTML='<div class="empty"><div style="font-size:42px">🤖</div><div>Click Run Analysis to get insights</div></div>';return;}
   el.innerHTML=ins.map(i=>`<div class="card">
     <div style="font-size:13px;font-weight:700;color:var(--purple);margin-bottom:4px">? Market Analysis</div>
     <div style="font-size:11px;color:var(--muted);margin-bottom:10px;font-family:'JetBrains Mono',monospace">${new Date(i.created_at).toLocaleString()} ? ${i.goals_analyzed||0} goals ? ${i.rules_analyzed||0} rules</div>
@@ -1060,10 +1176,10 @@ async function runAI(){
   try{
     const r=await fetch('/api/run_ai',{method:'POST'});
     const d=await r.json();
-    if(d.error)btn.textContent='[LOSE] '+d.error;
-    else{await loadAI();btn.textContent='[WIN] Done';}
-  }catch(e){btn.textContent='[LOSE] Error';}
-  setTimeout(()=>{btn.disabled=false;btn.textContent='[AI] Run Analysis';},3000);
+    if(d.error)btn.textContent='❌ '+d.error;
+    else{await loadAI();btn.textContent='✅ Done';}
+  }catch(e){btn.textContent='❌ Error';}
+  setTimeout(()=>{btn.disabled=false;btn.textContent='🤖 Run Analysis';},3000);
 }
 
 let _rulesCache = [];
@@ -1122,7 +1238,7 @@ function editRule(r){
   }
   
   document.getElementById('ar-modal-title').textContent = '?? Edit Rule';
-  document.getElementById('ar-save-btn').textContent = '[SAVE] Update Rule';
+  document.getElementById('ar-save-btn').textContent = '💾 Update Rule';
   document.getElementById('add-rule-modal').style.display='flex';
   updatePreview();
 }
@@ -1131,7 +1247,7 @@ function openAddRule(){
   document.getElementById('ar-rule-id').value = '';
   document.getElementById('ar-name').value = '';
   document.getElementById('ar-modal-title').textContent = '? Add New Rule';
-  document.getElementById('ar-save-btn').textContent = '[SAVE] Save Rule';
+  document.getElementById('ar-save-btn').textContent = '💾 Save Rule';
   document.getElementById('ar-mtype').value = 'FT';
   document.getElementById('ar-side').value = 'over';
   document.getElementById('ar-minutes').value = '1-20';
@@ -1152,7 +1268,7 @@ function updatePreview(){
   const odds=document.getElementById('ar-odds').value;
   const win=document.getElementById('ar-window').value;
   const line=document.getElementById('ar-line').value;
-  const sideText=side==='over'?'[SIGNAL] Goal expected':'[SHIELD] No goal expected';
+  const sideText=side==='over'?'🎯 Goal expected':'🛡 No goal expected';
   document.getElementById('ar-preview').innerHTML=
     `<b style="color:var(--text)">${name}</b><br>
     ${sideText} ? ${mtype} ? Line ${line.split('-')[0]} ? Min ${mins} ? Over ${odds} ? Check: ${win}`;
@@ -1212,7 +1328,7 @@ async function loadDebug(){
     const d=await fetch('/api/debug_odds').then(r=>r.json());
     const tried=(d.tried||[]).map(t=>`
       <div style="display:flex;gap:10px;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);font-size:12px;flex-wrap:wrap">
-        <span style="color:${t.has_totals?'var(--green)':'var(--muted)'}">${t.has_totals?'[WIN]':'--'}</span>
+        <span style="color:${t.has_totals?'var(--green)':'var(--muted)'}">${t.has_totals?'✅':'--'}</span>
         <span style="font-weight:600">${t.home||t.home_team||'?'} vs ${t.away||t.away_team||'?'}</span>
         <span style="color:var(--muted);font-size:10px">${t.league}</span>
         <span style="color:var(--blue);font-family:monospace;font-size:11px">[${(t.markets||[]).join(', ')}]</span>
@@ -1220,7 +1336,7 @@ async function loadDebug(){
     const ft=d.found_totals;
     const ftHtml=ft?`
       <div class="card" style="margin-top:10px;border-color:rgba(52,211,153,0.4)">
-        <div class="stit">[WIN] Found Totals -- ${ft.event?.home} vs ${ft.event?.away}</div>
+        <div class="stit">✅ Found Totals -- ${ft.event?.home} vs ${ft.event?.away}</div>
         ${(ft.all_markets||[]).filter(m=>m.name.includes('Total')).map(m=>`
           <div style="margin:6px 0">
             <div style="font-size:11px;color:var(--blue);margin-bottom:4px">${m.name}</div>
@@ -1234,7 +1350,7 @@ async function loadDebug(){
       </div>`:'<div style="color:var(--red);padding:10px">No Totals found in current events</div>';
     el.innerHTML=`
       <div class="card">
-        <div class="stit">${d.events_count||0} Live Events Scanned -- API Key: ${d.api_key_set?'[WIN]':'[LOSE]'}</div>
+        <div class="stit">${d.events_count||0} Live Events Scanned -- API Key: ${d.api_key_set?'✅':'❌'}</div>
         ${tried}
       </div>
       ${ftHtml}`;
@@ -1308,7 +1424,6 @@ def api_goals():
             result = []
             for r in rows:
                 mid,minute,sb,sa,period,home,away,league,gt = r
-                # Get odds 30s and 60s before goal
                 snap30 = conn.run("""SELECT mtype,line,over_odd,under_odd FROM odds_snapshots
                     WHERE mid=:a AND minute>=:b AND minute<=:c
                     ORDER BY saved_at DESC LIMIT 10""",
@@ -1317,17 +1432,42 @@ def api_goals():
                     WHERE mid=:a AND minute>=:b AND minute<=:c
                     ORDER BY saved_at DESC LIMIT 10""",
                     a=mid,b=max(0,minute-3),c=minute-1)
+                # Odds velocity
+                vel_snaps = conn.run("""SELECT over_odd FROM odds_snapshots
+                    WHERE mid=:a AND mtype='FT' AND line=2.5
+                    AND minute>=:b AND minute<=:c ORDER BY saved_at DESC LIMIT 6""",
+                    a=mid,b=max(0,minute-4),c=minute)
+                velocity,vel_dir = 0,"unknown"
+                if len(vel_snaps)>=2:
+                    try:
+                        n=float(vel_snaps[0][0] or 0); o=float(vel_snaps[-1][0] or 0)
+                        if n and o:
+                            velocity=round(n-o,3)
+                            vel_dir="rising_fast" if velocity>0.15 else "rising" if velocity>0.05 else "dropping_fast" if velocity<-0.15 else "dropping" if velocity<-0.05 else "stable"
+                    except: pass
+                # Dangerous attacks
+                da=conn.run("""SELECT dangerous_attacks_home,dangerous_attacks_away,shots_home,shots_away
+                    FROM match_stats WHERE mid=:a AND minute<=:b ORDER BY saved_at DESC LIMIT 1""",
+                    a=mid,b=minute)
+                da_data={"home":int(da[0][0]),"away":int(da[0][1]),"shots_home":int(da[0][2]),"shots_away":int(da[0][3])} if da else None
+                # Key minutes
+                km=conn.run("""SELECT minute,score_home,score_away,over_ft FROM key_minutes
+                    WHERE mid=:a AND minute<=:b ORDER BY minute DESC LIMIT 3""",a=mid,b=minute)
                 result.append({
                     "mid":mid,"minute":minute,"score_before":sb,"score_after":sa,
                     "period":period,"home":home,"away":away,"league":league,
                     "goal_time":str(gt),"home_team":home,"away_team":away,
                     "odds_30s":[{"mtype":s[0],"line":float(s[1]),"over":float(s[2]) if s[2] else None,"under":float(s[3]) if s[3] else None} for s in snap30],
                     "odds_60s":[{"mtype":s[0],"line":float(s[1]),"over":float(s[2]) if s[2] else None,"under":float(s[3]) if s[3] else None} for s in snap60],
-                    "had_snapshots":len(snap30)>0
+                    "had_snapshots":len(snap30)>0,
+                    "velocity":velocity,"vel_direction":vel_dir,"dangerous_attacks":da_data,
+                    "key_minutes":[{"minute":k[0],"score":f"{k[1]}-{k[2]}","over_ft":float(k[3]) if k[3] else None} for k in km]
                 })
             return jsonify(result)
         finally: release_db(conn)
-    except: return jsonify([])
+    except Exception as e:
+        log.error(f"api_goals: {e}")
+        return jsonify([])
 
 @app.route("/api/trades")
 def api_trades():
@@ -1544,40 +1684,56 @@ def api_run_ai():
     try:
         conn=get_db()
         try:
-            goals=conn.run("SELECT minute,score_before,period FROM goals ORDER BY goal_time DESC LIMIT 200")
+            goals=conn.run("SELECT minute,score_before,period,mid FROM goals ORDER BY goal_time DESC LIMIT 200")
             rules=conn.run("SELECT rule_name,status,total_signals,win_rate,profit FROM rules ORDER BY total_signals DESC")
-            matches=conn.run("SELECT COUNT(*) FROM matches")[0][0]
-            try:
-                trades=conn.run("SELECT result,COUNT(*) FROM trades WHERE result!='pending' GROUP BY result")
-            except: trades=[]
+            trades=conn.run("SELECT result,COUNT(*) FROM trades WHERE result!='pending' GROUP BY result")
 
-            prompt=f"""You are PapaGoal AI -- a football betting market analyst.
+            # Get odds snapshots before goals -- the core learning data
+            goal_odds = []
+            for g in goals[:50]:
+                mid, minute = g[3], g[0]
+                snaps = conn.run("""SELECT mtype,line,over_odd,under_odd FROM odds_snapshots
+                    WHERE mid=:a AND minute>=:b AND minute<=:c
+                    ORDER BY saved_at DESC LIMIT 6""",
+                    a=mid, b=max(0,minute-2), c=minute)
+                if snaps:
+                    goal_odds.append({
+                        "minute": minute,
+                        "score_before": g[1],
+                        "period": g[2],
+                        "odds_before": [{"mtype":s[0],"line":float(s[1]),"over":float(s[2]) if s[2] else None,"under":float(s[3]) if s[3] else None} for s in snaps]
+                    })
 
-Current data:
-- {matches} live matches tracked
-- {len(goals)} goals recorded so far
-- Rules: {[(r[0],r[1],r[2]) for r in rules]}
-- Resolved trades: {[(r[0],r[1]) for r in trades]}
+            prompt = f"""You are PapaGoal AI -- expert in football betting market patterns.
 
-Goals sample: {[(g[0],g[1],g[2]) for g in goals[:20]]}
+MISSION: Find what odds patterns ALWAYS appear before goals.
 
-{"NOTE: Very early stage -- only " + str(len(goals)) + " goals collected. Analysis will be limited." if len(goals) < 20 else ""}
+Data: {len(goals)} goals total, {len(goal_odds)} goals with odds snapshots.
 
-Please analyze:
-1. Which Over/Under lines and minute ranges show potential edge?
-2. Which rules look promising based on available data?
-3. What patterns should we watch for?
-4. Recommended next steps for data collection.
+GOALS WITH ODDS BEFORE THEM:
+{goal_odds[:30]}
 
-Be honest about data limitations. Say 'insufficient data' for specific claims needing more samples."""
+RULES PERFORMANCE:
+{[(r[0],r[1],r[2],r[3]) for r in rules]}
+
+TRADES: {[(r[0],r[1]) for r in trades]}
+
+ANALYZE:
+1. What Over/Under odds levels appear most before goals? (e.g. "Over 0.5 H1 between 1.4-1.8 in min 25-40")
+2. What odds levels appear before goals in final minutes (80-90)?
+3. Is there a pattern between score and odds before goals?
+4. What odds level means "goal very likely" vs "goal unlikely"?
+5. Suggest 2 specific rule improvements based on this data.
+
+Be specific with numbers. Focus on patterns that repeat across multiple goals."""
 
             resp=requests.post("https://api.anthropic.com/v1/messages",
                 headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"},
-                json={"model":"claude-sonnet-4-5","max_tokens":1200,"messages":[{"role":"user","content":prompt}]},
+                json={"model":"claude-sonnet-4-5","max_tokens":1500,"messages":[{"role":"user","content":prompt}]},
                 timeout=30)
             if resp.status_code==200:
                 text=resp.json()["content"][0]["text"]
-                conn.run("INSERT INTO insights (itype,content,goals_n,rules_n) VALUES ('market_analysis',:a,:b,:c)",
+                conn.run("INSERT INTO insights (itype,content,goals_n,rules_n) VALUES ('goal_pattern_analysis',:a,:b,:c)",
                     a=text,b=len(goals),c=len(rules))
                 return jsonify({"status":"ok"})
             return jsonify({"error":f"Claude API returned {resp.status_code}: {resp.text[:200]}"}),500

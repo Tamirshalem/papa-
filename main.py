@@ -1597,11 +1597,13 @@ def api_analytics():
             goals=conn.run("SELECT COUNT(*) FROM goals")[0][0]
             trades=conn.run("SELECT COUNT(*) FROM trades")[0][0]
             obs=conn.run("SELECT COUNT(*) FROM observations")[0][0]
+            try: snaps=conn.run("SELECT COUNT(*) FROM odds_snapshots")[0][0]
+            except: snaps=0
             wins=conn.run("SELECT COUNT(*) FROM trades WHERE result='win'")[0][0]
             done=conn.run("SELECT COUNT(*) FROM trades WHERE result!='pending'")[0][0]
             rate=round(wins/done*100) if done>0 else 0
             top=conn.run("SELECT rule_name,COUNT(*) cnt FROM trades GROUP BY rule_name ORDER BY cnt DESC LIMIT 8")
-            return jsonify({"goals":goals,"snapshots":0,"trades":trades,"obs":obs,"hit_rate":rate,
+            return jsonify({"goals":goals,"snapshots":snaps,"trades":trades,"obs":obs,"hit_rate":rate,
                            "top_rules":[{"name":r[0],"cnt":r[1]} for r in top]})
         finally: release_db(conn)
     except Exception as e:

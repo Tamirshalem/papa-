@@ -193,6 +193,7 @@ def init_db():
         try:
             conn.run("ALTER TABLE rules ADD COLUMN IF NOT EXISTS min_gap NUMERIC DEFAULT 0")
             conn.run("ALTER TABLE rules ADD COLUMN IF NOT EXISTS max_goals INT DEFAULT NULL")
+            conn.run("ALTER TABLE matches ADD COLUMN IF NOT EXISTS apifootball_id INT DEFAULT NULL")
         except: pass
         # Fix AI rules - they have wrong action_type or val_window
         conn.run("UPDATE rules SET val_window='FT',action_type='H1_OVER_LINE_BEFORE_HT' WHERE source='ai' AND mtype='H1' AND side='over'")
@@ -640,9 +641,18 @@ def collect():
                                 e=ft_snap.get("over") if ft_snap else None,
                                 f=ft_snap.get("under") if ft_snap else None)
                         except: pass
-                    # Fetch dangerous attacks from api-football (every ~60s to save quota)
-                    if APIFOOTBALL_KEY and cur_min % 2 == 0:
-                        fid = get_apifootball_id(p["home"],p["away"])
+                    # Fetch dangerous attacks from api-football (every 3 min to save quota)
+                    if APIFOOTBALL_KEY and cur_min % 3 == 0 and cur_min > 0:
+                        # Cache fixture_id in matches table to avoid repeat searches
+                        try:
+                            cached = conn.run("SELECT apifootball_id FROM matches WHERE mid=:a",a=mid)
+                            fid = cached[0][0] if cached and cached[0][0] else None
+                        except: fid = None
+                        if not fid:
+                            fid = get_apifootball_id(p["home"],p["away"])
+                            if fid:
+                                try: conn.run("UPDATE matches SET apifootball_id=:a WHERE mid=:b",a=fid,b=mid)
+                                except: pass
                         if fid:
                             stats = fetch_match_stats(fid)
                             if stats:
@@ -656,7 +666,7 @@ def collect():
                                         d=stats["dangerous_attacks_away"],
                                         e=stats["shots_home"],f=stats["shots_away"],
                                         g=stats["possession_home"])
-                                    log.debug(f"Stats saved: {p['home']} DA={stats['dangerous_attacks_home']}/{stats['dangerous_attacks_away']}")
+                                    log.info(f"Stats: {p['home']} DA={stats['dangerous_attacks_home']}/{stats['dangerous_attacks_away']}")
                                 except: pass
                     # Run rules
                     check_rules(conn,mid,p["home"],p["away"],p["league"],

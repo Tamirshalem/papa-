@@ -877,7 +877,7 @@ async function loadLive(){
       el.innerHTML=Object.values(bm).map(m=>{
         const ai=aiMap[m.match_id]?`<div style="background:rgba(59,130,246,0.06);border:1px solid rgba(59,130,246,0.2);border-radius:8px;padding:10px;margin-top:8px;font-size:13px;line-height:1.6;color:#94a3b8"><div style="font-size:10px;letter-spacing:2px;color:var(--blue);margin-bottom:4px">🤖 CLAUDE AI</div>${aiMap[m.match_id]}</div>`:'';
         const sigs=m.signals.map(s=>`<div class="rec-box">
-          <div class="rec-title">🎯 ${s.action_type} ? ${s.rule_name}</div>
+          <div class="rec-title">🎯 ${s.action_type} &middot; ${s.rule_name}</div>
           <div class="rec-row">
             <span>Market: <span class="rec-val">${s.market_type} ${s.line}</span></span>
             <span>Side: <span class="rec-val">${(s.selected_side||'').toUpperCase()}</span></span>
@@ -908,17 +908,45 @@ async function loadLive(){
           <div style="font-size:13px;font-weight:700;margin-bottom:4px">${m.home||m.home_team||'?'} vs ${m.away||m.away_team||'?'}</div>
           <div style="font-size:10px;color:var(--muted);margin-bottom:6px">${m.league||'Unknown League'}</div>
           <div class="bgs">
-            <span class="bg bgb">? ${m.minute}'</span>
+            <span class="bg bgb">⏱ ${m.minute}'</span>
             <span class="bg bgy">${m.score_home}-${m.score_away}</span>
             <span class="bg ${m.period==='H1'?'bgb':m.period==='H2'?'bgp':'bgg'}">${m.period}</span>
           </div>
+          <div id="da-${m.mid}" style="margin-top:6px;font-size:11px;color:var(--muted)">Loading stats...</div>
           <div class="match-odds-panel" style="display:none;margin-top:8px;border-top:1px solid var(--border);padding-top:8px">
             <div style="font-size:10px;color:var(--muted);margin-bottom:4px">📊 Opening Odds</div>
             <div class="odds-loading" style="font-size:11px;color:var(--muted)">Loading...</div>
           </div>
         </div>`).join('')+'</div>';
+      // Load DA for all matches
+      for(const m of matches){ loadDA(m.mid, m.home||m.home_team, m.away||m.away_team); }
     }
   }catch(e){console.error(e);}
+}
+
+async function loadDA(mid, home, away){
+  try{
+    const data = await fetch('/api/match_stats?mid='+mid).then(r=>r.json());
+    const el = document.getElementById('da-'+mid);
+    if(!el) return;
+    if(!data || !data.da_home && !data.da_away){
+      el.textContent='No stats yet';
+      return;
+    }
+    const daH = data.da_home||0, daA = data.da_away||0;
+    const total = daH+daA;
+    const danger = total>=12?'var(--red)':total>=7?'var(--yellow)':'var(--muted)';
+    const shotH = data.shots_home||0, shotA = data.shots_away||0;
+    el.innerHTML = `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <span style="color:${danger};font-weight:${total>=7?'700':'400'}">DA: ${daH}/${daA}</span>
+      <span style="color:var(--muted)">Shots: ${shotH}/${shotA}</span>
+      ${total>=10?'<span style="color:var(--red);font-size:10px;font-weight:700">HIGH PRESSURE</span>':''}
+      ${total>=7&&total<10?'<span style="color:var(--yellow);font-size:10px">pressure</span>':''}
+    </div>`;
+  }catch(e){
+    const el=document.getElementById('da-'+mid);
+    if(el) el.textContent='';
+  }
 }
 
 async function toggleMatchOdds(mid, card){
@@ -929,7 +957,6 @@ async function toggleMatchOdds(mid, card){
     try{
       const data = await fetch('/api/opening_odds?mid='+mid).then(r=>r.json());
       if(!data.length){ loader.textContent='No opening odds yet'; return; }
-      // Group by mtype
       const h1 = data.filter(o=>o.mtype==='H1');
       const ft = data.filter(o=>o.mtype==='FT');
       const row = (o) => `<div style="display:flex;justify-content:space-between;font-size:11px;padding:2px 0">
@@ -992,21 +1019,21 @@ async function loadTrades(){
   const profit=trades.reduce((s,t)=>s+(t.dummy_profit_loss||0),0);
   el.innerHTML=`
     <div class="sr">
-      <div class="sc"><div class="sn" style="color:var(--yellow)">${pend.length}</div><div class="sl">? Pending</div></div>
+      <div class="sc"><div class="sn" style="color:var(--yellow)">${pend.length}</div><div class="sl">⏳ Pending</div></div>
       <div class="sc"><div class="sn" style="color:var(--green)">${wins.length}</div><div class="sl">✅ Win</div></div>
       <div class="sc"><div class="sn" style="color:var(--red)">${lose.length}</div><div class="sl">❌ Lose</div></div>
-      <div class="sc"><div class="sn" style="color:${profit>=0?'var(--green)':'var(--red)'}">${pct}% ? ?${profit.toFixed(0)}</div><div class="sl">Hit Rate ? P&L</div></div>
+      <div class="sc"><div class="sn" style="color:${profit>=0?'var(--green)':'var(--red)'}">${pct}% &middot; &euro;${profit.toFixed(0)}</div><div class="sl">Hit Rate &middot; P&L</div></div>
     </div>
     <div class="stit">All Trades (${trades.length})</div>
     ${!trades.length?'<div class="empty"><div style="font-size:42px">?</div><div>No trades yet</div></div>':
       trades.map(t=>{
         const rc=t.result==='pending'?'bgy':t.result==='win'?'bgg':'bgr';
-        const rl=t.result==='pending'?'? PENDING':t.result==='win'?'✅ WIN':'❌ LOSE';
+        const rl=t.result==='pending'?'⏳ PENDING':t.result==='win'?'✅ WIN':'❌ LOSE';
         const bc=t.result==='pending'?'var(--yellow)':t.result==='win'?'var(--green)':'var(--red)';
         return `<div class="card" style="border-color:${bc}33">
           <div class="ctop">
             <div><div class="mn">${t.home||t.home_team||'?'} vs ${t.away||t.away_team||'?'}</div>
-            <div class="ml">${t.rule_name} ? ${(t.mtype||'FT')==='H1'?'First Half':'Full Match'} ? Line ${t.line||''} ? ${(t.side||'').toUpperCase()==='OVER'?'? OVER':'? UNDER'}</div></div>
+            <div class="ml">${t.rule_name} &middot; ${(t.mtype||'FT')==='H1'?'First Half':'Full Match'} &middot; Line ${t.line||''} ? ${(t.side||'').toUpperCase()==='OVER'?'? OVER':'? UNDER'}</div></div>
             <div class="bgs">
               ${(t.minute_entry||t.entry_min)>0?`<span class="bg bgb">? ${t.minute_entry||t.entry_min}'</span>`:''}
               <span class="bg ${rc}">${rl}</span>
@@ -1017,9 +1044,9 @@ async function loadTrades(){
             <div class="ot"><div class="ol">EXPECTED</div><div class="ov">${t.expected_odd||'--'}</div></div>
             <div class="ot"><div class="ol">GAP</div><div class="ov" style="color:var(--blue)">${t.gap||0}</div></div>
             <div class="ot"><div class="ol">PRESSURE</div><div class="ov">${t.pressure||t.pressure_score||0}%</div></div>
-            ${t.result!=='pending'?`<div class="ot"><div class="ol">P&L</div><div class="ov" style="color:${(t.profit||t.dummy_profit_loss||0)>=0?'var(--green)':'var(--red)'}">?${(t.profit||t.dummy_profit_loss||0).toFixed(0)}</div></div>`:''}
+            ${t.result!=='pending'?`<div class="ot"><div class="ol">P&L</div><div class="ov" style="color:${(t.profit||t.dummy_profit_loss||0)>=0?'var(--green)':'var(--red)'}">&euro;${(t.profit||t.dummy_profit_loss||0).toFixed(0)}</div></div>`:''}
           </div>
-          <div style="font-size:11px;color:var(--muted)">${(()=>{const m={'OVER_LINE_WITHIN_10M':'🎯 Goal in 10min','OVER_LINE_WITHIN_5M':'🎯 Goal in 5min','UNDER_HOLDS_10M':'🛡 No goal 10min','H1_OVER_LINE_BEFORE_HT':'🎯 Goal before HT','UNDER_HOLDS_TO_HT':'🛡 No goal to HT','OVER_LINE_BEFORE_FT':'🎯 Goal before FT','OVER_LINE_WITHIN_15M':'🎯 Goal in 15min'};return m[t.action_type]||t.action_type;})()} ? Window: ${t.val_window||'10m'} ? Score: ${t.score_entry||'--'}</div>
+          <div style="font-size:11px;color:var(--muted)">${(()=>{const m={'OVER_LINE_WITHIN_10M':'🎯 Goal in 10min','OVER_LINE_WITHIN_5M':'🎯 Goal in 5min','UNDER_HOLDS_10M':'🛡 No goal 10min','H1_OVER_LINE_BEFORE_HT':'🎯 Goal before HT','UNDER_HOLDS_TO_HT':'🛡 No goal to HT','OVER_LINE_BEFORE_FT':'🎯 Goal before FT','OVER_LINE_WITHIN_15M':'🎯 Goal in 15min'};return m[t.action_type]||t.action_type;})()} &middot; Window: ${t.val_window||'10m'} &middot; Score: ${t.score_entry||'--'}</div>
           ${(t.fail_reason||t.failure_reason)?`<div style="font-size:11px;color:var(--red);margin-top:4px">${t.fail_reason||t.failure_reason}</div>`:""}
         </div>`;
       }).join('')}`;
@@ -1033,7 +1060,7 @@ async function loadObs(){
     <div class="card">
       <div class="ctop">
         <div><div class="mn">${o.home||o.home_team||'?'} vs ${o.away||o.away_team||'?'}</div>
-        <div class="ml">${o.rule_name} ? ${o.league||''}</div></div>
+        <div class="ml">${o.rule_name} &middot; ${o.league||''}</div></div>
         <div class="bgs">
           ${o.minute>0?`<span class="bg bgb">? ${o.minute}'</span>`:''}
           <span class="bg bgy">${o.mtype||o.market_type||'FT'} ${o.line||''}</span>
@@ -1278,7 +1305,7 @@ function updatePreview(){
   const sideText=side==='over'?'🎯 Goal expected':'🛡 No goal expected';
   document.getElementById('ar-preview').innerHTML=
     `<b style="color:var(--text)">${name}</b><br>
-    ${sideText} ? ${mtype} ? Line ${line.split('-')[0]} ? Min ${mins} ? Over ${odds} ? Check: ${win}`;
+    ${sideText} &middot; ${mtype} &middot; Line ${line.split('-')[0]} &middot; Min ${mins} &middot; Over ${odds} &middot; Check: ${win}`;
 }
 // Update preview on change
 setTimeout(()=>{
@@ -1653,6 +1680,23 @@ def api_debug_odds():
         return jsonify(result)
     except Exception as e:
         return jsonify({"error":str(e)})
+
+@app.route("/api/match_stats")
+def api_match_stats():
+    try:
+        mid = request.args.get("mid")
+        if not mid: return jsonify({})
+        conn=get_db()
+        try:
+            r=conn.run("""SELECT dangerous_attacks_home,dangerous_attacks_away,
+                shots_home,shots_away,possession_home,minute
+                FROM match_stats WHERE mid=:a ORDER BY saved_at DESC LIMIT 1""",a=mid)
+            if not r: return jsonify({})
+            return jsonify({"da_home":int(r[0][0]),"da_away":int(r[0][1]),
+                "shots_home":int(r[0][2]),"shots_away":int(r[0][3]),
+                "possession_home":int(r[0][4]),"minute":r[0][5]})
+        finally: release_db(conn)
+    except Exception as e: return jsonify({"error":str(e)}),500
 
 @app.route("/api/opening_odds")
 def api_opening_odds():

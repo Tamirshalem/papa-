@@ -1562,6 +1562,74 @@ def api_observations():
         finally: release_db(conn)
     except: return jsonify([])
 
+@app.route("/api/debug_rules")
+def api_debug_rules():
+    """Check why AI rules aren't firing - compare rule conditions vs actual market data"""
+    try:
+        conn = get_db()
+        try:
+            # Get AI rules
+            ai_rules = conn.run("""SELECT id,rule_name,mtype,line_min,line_max,
+                min_min,min_max,over_min,over_max,under_min,under_max,side,status,is_active
+                FROM rules WHERE status IN ('AI_HYPOTHESIS','TESTING','PROMISING') ORDER BY id""")
+            
+            # Get recent odds snapshots (last 10 min)
+            recent = conn.run("""SELECT mid,minute,mtype,line,over_odd,under_odd 
+                FROM odds_snapshots WHERE saved_at > NOW()-INTERVAL '10 minutes'
+                ORDER BY saved_at DESC LIMIT 200""")
+            
+            results = []
+            for rule in ai_rules:
+                rid,rname,mtype,lmin,lmax,mmin,mmax,ovmin,ovmax,unmin,unmax,side,status,is_active = rule
+                matches_found = 0
+                fail_reasons = set()
+                
+                for snap in recent:
+                    smid,smin,smtype,sline,sover,sunder = snap
+                    
+                    if smtype != mtype: 
+                        fail_reasons.add(f"mtype: got {smtype} need {mtype}")
+                        continue
+                    if lmin and sline < lmin:
+                        fail_reasons.add(f"line {sline} < lmin {lmin}")
+                        continue
+                    if lmax and sline > lmax:
+                        fail_reasons.add(f"line {sline} > lmax {lmax}")
+                        continue
+                    if mmin and smin < mmin:
+                        fail_reasons.add(f"minute {smin} < mmin {mmin}")
+                        continue
+                    if mmax and smin > mmax:
+                        fail_reasons.add(f"minute {smin} > mmax {mmax}")
+                        continue
+                    odd = sover if side=="over" else sunder
+                    odd = float(odd) if odd else None
+                    if side=="over":
+                        if not sover: fail_reasons.add("no over_odd"); continue
+                        if ovmin and float(sover)<ovmin: fail_reasons.add(f"over {sover}<{ovmin}"); continue
+                        if ovmax and float(sover)>ovmax: fail_reasons.add(f"over {sover}>{ovmax}"); continue
+                    else:
+                        if not sunder: fail_reasons.add("no under_odd"); continue
+                        if unmin and float(sunder)<unmin: fail_reasons.add(f"under {sunder}<{unmin}"); continue
+                        if unmax and float(sunder)>unmax: fail_reasons.add(f"under {sunder}>{unmax}"); continue
+                    matches_found += 1
+                
+                results.append({
+                    "rule": rname, "status": status, "active": is_active,
+                    "conditions": f"{mtype} line {lmin}-{lmax} min {mmin}-{mmax} {'over' if side=='over' else 'under'} {ovmin if side=='over' else unmin}-{ovmax if side=='over' else unmax}",
+                    "matches_in_10min": matches_found,
+                    "fail_reasons": list(fail_reasons)[:5]
+                })
+            
+            return jsonify({
+                "recent_snapshots": len(recent),
+                "rules_checked": len(results),
+                "results": results
+            })
+        finally: release_db(conn)
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
 @app.route("/api/rules")
 def api_rules():
     try:
@@ -1643,6 +1711,88 @@ def api_rules_toggle():
     except Exception as e:
         log.error(f"Toggle error: {e}")
         return jsonify({"error":str(e)}),500
+
+@app.route("/api/deep_analysis")
+def api_deep_analysis():
+    """Deep analysis of goals, trades and rules performance"""
+    try:
+        conn = get_db()
+        try:
+            # Goals by minute bucket
+            goal_buckets = conn.run("""
+                SELECT 
+                    CASE 
+                        WHEN minute <= 10 THEN '0-10'
+                        WHEN minute <= 20 THEN '11-20'
+                        WHEN minute <= 30 THEN '21-30'
+                        WHEN minute <= 45 THEN '31-45'
+                        WHEN minute <= 60 THEN '46-60'
+                        WHEN minute <= 70 THEN '61-70'
+                        WHEN minute <= 80 THEN '71-80'
+                        WHEN minute <= 90 THEN '81-90'
+                        ELSE '90+' END as bucket,
+                    COUNT(*) as cnt
+                FROM goals GROUP BY 1 ORDER BY MIN(minute)""")
+            
+            # Goals by period
+            period_dist = conn.run("""
+                SELECT period, COUNT(*) FROM goals GROUP BY period ORDER BY 2 DESC""")
+            
+            # Rules performance - resolved only
+            rules_perf = conn.run("""
+                SELECT rule_name, 
+                    COUNT(*) total,
+                    SUM(CASE WHEN result='win' THEN 1 ELSE 0 END) wins,
+                    SUM(CASE WHEN result='lose' THEN 1 ELSE 0 END) losses,
+                    SUM(CASE WHEN result='pending' THEN 1 ELSE 0 END) pending,
+                    ROUND(SUM(CASE WHEN result='win' THEN 1.0 ELSE 0 END) / 
+                        NULLIF(SUM(CASE WHEN result!='pending' THEN 1 ELSE 0 END),0) * 100, 1) as hit_rate,
+                    ROUND(SUM(COALESCE(profit,0))::numeric, 0) as total_profit
+                FROM trades 
+                GROUP BY rule_name 
+                ORDER BY total DESC""")
+            
+            # Total resolved vs pending
+            resolved = conn.run("SELECT COUNT(*) FROM trades WHERE result!='pending'")[0][0]
+            pending_cnt = conn.run("SELECT COUNT(*) FROM trades WHERE result='pending'")[0][0]
+            wins_total = conn.run("SELECT COUNT(*) FROM trades WHERE result='win'")[0][0]
+            
+            # Odds before goals - what was the FT 2.5 over odd
+            odds_at_goal = conn.run("""
+                SELECT 
+                    CASE WHEN o.over_odd < 1.5 THEN '<1.5'
+                         WHEN o.over_odd < 2.0 THEN '1.5-2.0'
+                         WHEN o.over_odd < 2.5 THEN '2.0-2.5'
+                         WHEN o.over_odd < 3.0 THEN '2.5-3.0'
+                         ELSE '3.0+' END as odds_range,
+                    COUNT(*) as goals
+                FROM goals g
+                JOIN odds_snapshots o ON o.mid=g.mid 
+                    AND o.mtype='FT' AND o.line=2.5
+                    AND o.minute >= g.minute-2 AND o.minute <= g.minute
+                GROUP BY 1 ORDER BY MIN(o.over_odd)""")
+            
+            return jsonify({
+                "goal_buckets": [{"bucket":r[0],"count":int(r[1])} for r in goal_buckets],
+                "period_dist": [{"period":r[0],"count":int(r[1])} for r in period_dist],
+                "rules_perf": [{
+                    "name":r[0],"total":int(r[1]),"wins":int(r[2]),"losses":int(r[3]),
+                    "pending":int(r[4]),"hit_rate":float(r[5]) if r[5] else 0,
+                    "profit":float(r[6]) if r[6] else 0
+                } for r in rules_perf],
+                "summary": {
+                    "total_trades": int(resolved+pending_cnt),
+                    "resolved": int(resolved),
+                    "pending": int(pending_cnt),
+                    "wins": int(wins_total),
+                    "hit_rate": round(wins_total/resolved*100,1) if resolved>0 else 0
+                },
+                "odds_at_goal": [{"range":r[0],"goals":int(r[1])} for r in odds_at_goal]
+            })
+        finally: release_db(conn)
+    except Exception as e:
+        log.error(f"deep_analysis: {e}")
+        return jsonify({"error":str(e)})
 
 @app.route("/api/analytics")
 def api_analytics():

@@ -433,7 +433,7 @@ def check_rules(conn, mid, home, away, league, minute, sh, sa, period, markets, 
                     op_s = float(op_db.get("over") or 0) if side=="over" else float(op_db.get("under") or 0)
                     actual_gap = entry_odd - op_s if op_s else 0
                     if actual_gap < min_gap: continue
-                # If no opening odds — still allow signal (gap check skipped)
+                # If no opening odds -- still allow signal (gap check skipped)
 
             hk = ckey(mid, mtype, str(line))
             held = held_map.get(hk, 0)
@@ -963,10 +963,10 @@ async function loadGoals(){
     };
     return `<div class="card win">
       <div class="ctop">
-        <div><div class="mn">${g.home||g.home_team||'?'} vs ${g.away||g.away_team||'?'}</div><div class="ml">${g.league||''} ? ${g.period||'FT'}</div></div>
+        <div><div class="mn">${g.home||g.home_team||'?'} vs ${g.away||g.away_team||'?'}</div><div class="ml">${g.league||''} &middot; ${g.period||'FT'}</div></div>
         <div style="font-size:16px;font-weight:700;font-family:'JetBrains Mono',monospace;color:var(--green)">⚽ Min ${g.minute}</div>
       </div>
-      <div style="font-size:12px;color:var(--muted);margin-bottom:8px">${g.score_before||'?'} ? ${g.score_after||'?'}</div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:8px">${g.score_before||'?'} &rarr; ${g.score_after||'?'}</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
         <div style="background:var(--bg);border-radius:6px;padding:8px">
           <div style="font-size:10px;color:var(--muted);margin-bottom:4px">~30s before</div>
@@ -1781,8 +1781,8 @@ def api_ai_rules():
             prompt = (
                 "You are PapaGoal AI. Find Over/Under mispricings in football.\n\n"
                 "PATTERNS TO FIND:\n"
-                "1. Stable odds (1.5 or 2.5) for 1-2min = goal imminent -> OVER\n"
-                "2. Fast rising odds = no goal -> UNDER\n"
+                "1. Stable odds (1.5 or 2.5) for 1-2min = goal imminent &rarr; OVER\n"
+                "2. Fast rising odds = no goal &rarr; UNDER\n"
                 "3. Key minutes: 18, 30, 45, 78, 84, 85+\n\n"
                 "Actions: OVER_LINE_WITHIN_5M, OVER_LINE_WITHIN_10M, OVER_LINE_WITHIN_15M, "
                 "H1_OVER_LINE_BEFORE_HT, UNDER_HOLDS_10M, UNDER_HOLDS_TO_HT, OVER_LINE_BEFORE_FT\n"

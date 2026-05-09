@@ -195,7 +195,15 @@ def init_db():
             conn.run("ALTER TABLE rules ADD COLUMN IF NOT EXISTS max_goals INT DEFAULT NULL")
             conn.run("ALTER TABLE matches ADD COLUMN IF NOT EXISTS apifootball_id INT DEFAULT NULL")
         except: pass
-        # Fix AI rules - they have wrong action_type or val_window
+        # Close stale pending trades from ended matches
+        try:
+            conn.run("""UPDATE trades SET result='lose',fail_reason='Match ended - stale',
+                resolved_at=NOW(),profit=-100
+                WHERE result='pending' 
+                AND created_at < NOW() - INTERVAL '3 hours'""")
+            closed = conn.run("SELECT COUNT(*) FROM trades WHERE fail_reason='Match ended - stale'")[0][0]
+            if closed > 0: log.info(f"Closed {closed} stale trades on startup")
+        except Exception as e: log.warning(f"Stale cleanup: {e}")
         conn.run("UPDATE rules SET val_window='FT',action_type='H1_OVER_LINE_BEFORE_HT' WHERE source='ai' AND mtype='H1' AND side='over'")
         conn.run("UPDATE rules SET val_window='FT',action_type='OVER_LINE_BEFORE_FT' WHERE source='ai' AND mtype='FT' AND side='over'")
         conn.run("UPDATE rules SET val_window='FT',action_type='UNDER_HOLDS_10M' WHERE source='ai' AND side='under'")
@@ -490,7 +498,7 @@ def check_rules(conn, mid, home, away, league, minute, sh, sa, period, markets, 
 def validate_trades(conn):
     try:
         pending = conn.run("""SELECT id,mid,rule_id,action_type,validation_window,
-            entry_odd,side,mtype,line,created_at,entry_goals,entry_minute
+            entry_odd,side,mtype,line,created_at,entry_goals,entry_min
             FROM trades WHERE result='pending'""")
     except Exception as e: log.warning(f"Validate: {e}"); return
     for p in pending:

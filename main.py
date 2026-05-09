@@ -1691,6 +1691,40 @@ def api_debug_odds():
     except Exception as e:
         return jsonify({"error":str(e)})
 
+@app.route("/api/test_apifootball")
+def api_test_apifootball():
+    """Test if api-football integration works"""
+    if not APIFOOTBALL_KEY:
+        return jsonify({"error":"No APIFOOTBALL_KEY set"})
+    try:
+        # Get all live fixtures from api-football
+        r = requests.get("https://v3.football.api-sports.io/fixtures",
+            headers={"x-apisports-key": APIFOOTBALL_KEY},
+            params={"live":"all"}, timeout=10)
+        result = {"status":r.status_code,"key_set":True}
+        if r.status_code == 200:
+            data = r.json()
+            fixtures = data.get("response",[])
+            result["live_count"] = len(fixtures)
+            result["errors"] = data.get("errors",[])
+            # Show first 5 matches
+            result["sample"] = []
+            for fix in fixtures[:5]:
+                fid = fix.get("fixture",{}).get("id")
+                home = fix.get("teams",{}).get("home",{}).get("name")
+                away = fix.get("teams",{}).get("away",{}).get("name")
+                result["sample"].append({"id":fid,"home":home,"away":away})
+            # Try to get stats for first fixture
+            if fixtures:
+                fid = fixtures[0].get("fixture",{}).get("id")
+                stats = fetch_match_stats(fid)
+                result["stats_sample"] = stats
+        else:
+            result["body"] = r.text[:500]
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error":str(e)})
+
 @app.route("/api/match_stats")
 def api_match_stats():
     try:

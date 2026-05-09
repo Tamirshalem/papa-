@@ -197,7 +197,15 @@ def init_db():
         # Fix AI rules - they have wrong action_type or val_window
         conn.run("UPDATE rules SET val_window='FT',action_type='H1_OVER_LINE_BEFORE_HT' WHERE source='ai' AND mtype='H1' AND side='over'")
         conn.run("UPDATE rules SET val_window='FT',action_type='OVER_LINE_BEFORE_FT' WHERE source='ai' AND mtype='FT' AND side='over'")
+        conn.run("UPDATE rules SET val_window='FT',action_type='UNDER_HOLDS_10M' WHERE source='ai' AND side='under'")
         conn.run("UPDATE rules SET val_window='FT' WHERE val_window IN ('HT','10m','15m','5m')")
+        # Fix all AI rules action_type based on mtype+side
+        conn.run("""UPDATE rules SET action_type=CASE 
+            WHEN mtype='H1' AND side='over' THEN 'H1_OVER_LINE_BEFORE_HT'
+            WHEN mtype='FT' AND side='over' THEN 'OVER_LINE_BEFORE_FT'
+            WHEN side='under' THEN 'UNDER_HOLDS_10M'
+            ELSE action_type END
+            WHERE status='AI_HYPOTHESIS'""")
         conn.run("UPDATE rules SET over_min=2.70,description='FT Over >=2.70 after min 82 -- hold Under' WHERE rule_name='Market Shut'")
         conn.run("UPDATE rules SET over_min=2.00,over_max=2.65,min_min=85,min_max=95,description='FT Over 2.00-2.65 at min 85+ -- market expects goal' WHERE rule_name='Late FT Goal Hold'")
         conn.run("UPDATE rules SET side='under' WHERE rule_name='Market Shut' AND side='over'")
@@ -425,8 +433,7 @@ def check_rules(conn, mid, home, away, league, minute, sh, sa, period, markets, 
                     op_s = float(op_db.get("over") or 0) if side=="over" else float(op_db.get("under") or 0)
                     actual_gap = entry_odd - op_s if op_s else 0
                     if actual_gap < min_gap: continue
-                else:
-                    continue  # No opening odds saved yet -- skip
+                # If no opening odds — still allow signal (gap check skipped)
 
             hk = ckey(mid, mtype, str(line))
             held = held_map.get(hk, 0)

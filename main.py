@@ -490,11 +490,11 @@ def check_rules(conn, mid, home, away, league, minute, sh, sa, period, markets, 
 def validate_trades(conn):
     try:
         pending = conn.run("""SELECT id,mid,rule_id,action_type,validation_window,
-            entry_odd,side,mtype,line,created_at,entry_goals
+            entry_odd,side,mtype,line,created_at,entry_goals,entry_minute
             FROM trades WHERE result='pending'""")
     except Exception as e: log.warning(f"Validate: {e}"); return
     for p in pending:
-        tid,mid,rid,action,val_win,entry_odd,side,mtype,line,created_at,entry_goals = p
+        tid,mid,rid,action,val_win,entry_odd,side,mtype,line,created_at,entry_goals,entry_min = p
         now = datetime.now(timezone.utc)
         created = created_at if created_at.tzinfo else created_at.replace(tzinfo=timezone.utc)
         elapsed = (now - created).total_seconds() / 60
@@ -518,7 +518,8 @@ def validate_trades(conn):
         elif action == "UNDER_HOLDS_10M":
             if line_crossed: result,fail="lose","Line crossed"
             elif cur_period=="FT": result="win"
-            elif cur_min and entry_min and cur_min >= 95: result="win"  # match clearly over
+            elif cur_min and cur_min >= 95: result="win"
+            elif elapsed>15: result="win"  # 10m+buffer passed without goal
         elif action in ("H1_OVER_LINE_BEFORE_HT","H1_GOAL_BEFORE_HT"):
             ht = cur_period in ("H2","FT","HT") or (cur_period=="H1" and (cur_min or 0)>=45)
             if cur_period=="FT": result="win" if line_crossed else "lose"; fail="Not crossed by FT" if result=="lose" else None
@@ -532,18 +533,20 @@ def validate_trades(conn):
         elif action in ("OVER_LINE_BEFORE_FT","GOAL_BY_FT"):
             if cur_period=="FT": result="win" if line_crossed else "lose"; fail="Not crossed by FT" if result=="lose" else None
             elif elapsed>35: result,fail="lose","FT timeout"
+        # Stale trade safety net - close anything older than 3 hours
+        if not result and elapsed > 180:
+            result, fail = "lose", "Stale trade timeout"
         if result:
             profit = round((float(entry_odd or 1)-1)*100,2) if result=="win" else -100.0
-            emoji = "✅ WIN" if result=="win" else "❌ LOSE"
-            log.info(f"{emoji} | {action} | {side}@{entry_odd} | {fail or 'resolved'} | P&L: ?{profit:+.0f}")
+            log.info(f"{result.upper()} | {action} | {side}@{entry_odd} | {fail or 'resolved'} | P&L: {profit:+.0f}")
             try:
                 conn.run("""UPDATE trades SET result=:a,resolved_at=NOW(),profit=:b,fail_reason=:c WHERE id=:d""",
                     a=result,b=profit,c=fail,d=tid)
                 if result=="win":
-                    conn.run("""UPDATE rules SET wins=wins+1,win_rate=ROUND((wins+1)::float/(wins+losses+1)*100,1),profit=profit+:a,updated_at=NOW() WHERE id=:b""",a=profit,b=rid)
+                    conn.run("""UPDATE rules SET wins=wins+1,win_rate=ROUND(((wins+1)::numeric/(wins+losses+1)*100),1),profit=profit+:a,updated_at=NOW() WHERE id=:b""",a=profit,b=rid)
                 else:
-                    conn.run("""UPDATE rules SET losses=losses+1,win_rate=CASE WHEN wins+losses+1>0 THEN ROUND(wins::float/(wins+losses+1)*100,1) ELSE 0 END,profit=profit+:a,updated_at=NOW() WHERE id=:b""",a=profit,b=rid)
-            except Exception as e: log.debug(f"Validate update: {e}")
+                    conn.run("""UPDATE rules SET losses=losses+1,win_rate=CASE WHEN wins+losses+1>0 THEN ROUND((wins::numeric/(wins+losses+1)*100),1) ELSE 0 END,profit=profit+:a,updated_at=NOW() WHERE id=:b""",a=profit,b=rid)
+            except Exception as e: log.error(f"Validate update: {e}")
 
 def collect():
     try:
@@ -1101,11 +1104,11 @@ async function loadRules(){
   el.innerHTML=rules.map(r=>{
     const wr=parseFloat(r.win_rate||0);
     const wc=wr>=60?'var(--green)':wr>=45?'var(--yellow)':'var(--red)';
-    const resolved=(r.win_count||0)+(r.lose_count||0);
+    const resolved=(r.wins||r.win_count||0)+(r.losses||r.lose_count||0);
     const pending=(r.total_signals||0)-resolved;
     const prof=r.profit||r.dummy_profit||0;
-    const sideLabel=r.selected_side==='under'?'? UNDER':'? OVER';
-    const sideColor=r.selected_side==='under'?'var(--purple)':'var(--green)';
+    const sideLabel=r.selected_side==='under'||r.side==='under'?'🛡 UNDER':'🎯 OVER';
+    const sideColor=r.selected_side==='under'||r.side==='under'?'var(--purple)':'var(--green)';
     // Conditions summary
     const oddRange=r.side==='under'
       ?`Under ${r.under_min||r.under_odd_min||'?'}-${r.under_max||r.under_odd_max||'?'}`
@@ -1688,6 +1691,26 @@ def api_debug_odds():
         result["tried"] = tried[:15]
         result["found_totals"] = found_totals
         return jsonify(result)
+    except Exception as e:
+        return jsonify({"error":str(e)})
+
+@app.route("/api/test_stats_raw")
+def api_test_stats_raw():
+    """See raw stats from api-football"""
+    if not APIFOOTBALL_KEY: return jsonify({"error":"No key"})
+    try:
+        r = requests.get("https://v3.football.api-sports.io/fixtures",
+            headers={"x-apisports-key": APIFOOTBALL_KEY},
+            params={"live":"all"}, timeout=10)
+        if r.status_code != 200: return jsonify({"error":r.status_code})
+        fixtures = r.json().get("response",[])
+        if not fixtures: return jsonify({"error":"No live fixtures"})
+        fid = fixtures[0].get("fixture",{}).get("id")
+        # Get stats
+        s = requests.get("https://v3.football.api-sports.io/fixtures/statistics",
+            headers={"x-apisports-key": APIFOOTBALL_KEY},
+            params={"fixture": fid}, timeout=10)
+        return jsonify({"fixture_id":fid,"raw":s.json()})
     except Exception as e:
         return jsonify({"error":str(e)})
 

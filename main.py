@@ -164,7 +164,7 @@ def init_db():
         conn.run("""
             CREATE TABLE IF NOT EXISTS signal_results (
                 id SERIAL PRIMARY KEY,
-                signal_id INT UNIQUE,
+                signal_id INT,
                 match_id TEXT,
                 rule_id TEXT,
                 rule_number INT,
@@ -187,6 +187,14 @@ def init_db():
         """)
         conn.run("CREATE INDEX IF NOT EXISTS idx_signal_id ON signal_results(signal_id)")
         conn.run("CREATE INDEX IF NOT EXISTS idx_rule_id ON signal_results(rule_id)")
+        # Add unique constraint safely (only if not exists)
+        try:
+            conn.run("""
+                ALTER TABLE signal_results
+                ADD CONSTRAINT signal_results_signal_id_unique UNIQUE (signal_id)
+            """)
+        except Exception:
+            pass  # already exists
 
         # Track which matches have reached FT (for stable validation)
         conn.run("""
@@ -1373,19 +1381,28 @@ def export_results():
 
 @app.route("/health")
 def health():
+    """Simple health endpoint — does NOT touch DB so it always responds fast"""
     return jsonify({
         "status": "ok",
+        "version": "v5",
         "time": datetime.now(timezone.utc).isoformat(),
         "live_matches": len(live_match_data)
     })
 
 
-# ─── Bootstrap (works with both gunicorn and direct run) ─
-log.info("🚀 PapaGoal v4 starting...")
-init_db()
-_collector_thread = threading.Thread(target=collector_loop, daemon=True)
-_collector_thread.start()
-log.info(f"📡 Collector started — polling every {POLL_INTERVAL}s")
+# ─── Bootstrap (non-blocking — runs after Flask is ready) ──
+def background_startup():
+    """Run heavy startup tasks in background so /health responds immediately"""
+    try:
+        log.info("🚀 PapaGoal v5 starting (background)...")
+        init_db()
+        log.info(f"📡 Starting collector — polling every {POLL_INTERVAL}s")
+        collector_loop()
+    except Exception as e:
+        log.error(f"Background startup error: {e}", exc_info=True)
+
+_startup_thread = threading.Thread(target=background_startup, daemon=True)
+_startup_thread.start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT, debug=False)

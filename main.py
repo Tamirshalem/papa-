@@ -160,6 +160,46 @@ def init_db():
             )
         """)
 
+        # ─── Signal validation results (Win/Loss tracking) ──
+        conn.run("""
+            CREATE TABLE IF NOT EXISTS signal_results (
+                id SERIAL PRIMARY KEY,
+                signal_id INT UNIQUE,
+                match_id TEXT,
+                rule_id TEXT,
+                rule_number INT,
+                prediction TEXT,
+                market TEXT,
+                signal_minute INT,
+                signal_score_home INT,
+                signal_score_away INT,
+                signal_odds FLOAT,
+                final_minute INT,
+                final_score_home INT,
+                final_score_away INT,
+                final_period TEXT,
+                goals_after_signal INT,
+                result TEXT,
+                profit FLOAT,
+                validated_at TIMESTAMPTZ DEFAULT NOW(),
+                notes TEXT
+            )
+        """)
+        conn.run("CREATE INDEX IF NOT EXISTS idx_signal_id ON signal_results(signal_id)")
+        conn.run("CREATE INDEX IF NOT EXISTS idx_rule_id ON signal_results(rule_id)")
+
+        # Track which matches have reached FT (for stable validation)
+        conn.run("""
+            CREATE TABLE IF NOT EXISTS match_completions (
+                match_id TEXT PRIMARY KEY,
+                first_seen_ft TIMESTAMPTZ DEFAULT NOW(),
+                final_score_home INT,
+                final_score_away INT,
+                final_minute INT,
+                validated_at TIMESTAMPTZ
+            )
+        """)
+
         log.info("✅ Database initialized")
     except Exception as e:
         log.error(f"DB init error: {e}")
@@ -429,6 +469,144 @@ Duration Rule: יחס שמחזיק 2+ דקות = שוק מאמין. יחס שק�
     return None
 
 
+# ─── Validation Engine (post-FT signal evaluation) ───────
+FT_STABILITY_MINUTES = 10  # wait 10 min after FT before validating
+
+def mark_completed_matches():
+    """Track matches that reached FT in this poll cycle.
+    Only matches stable for FT_STABILITY_MINUTES will be validated."""
+    conn = get_db()
+    try:
+        # Find all matches currently in FT state from Football API
+        ft_matches = []
+        for key, data in live_match_data.items():
+            if "_" in key and data.get("period") == "FT":
+                ft_matches.append({
+                    "key": key,
+                    "sh": data.get("sh", 0),
+                    "sa": data.get("sa", 0),
+                    "minute": data.get("minute", 90)
+                })
+
+        for ft in ft_matches:
+            # Try to find the match_id from odds_snapshots by team names
+            parts = ft["key"].split("_", 1)
+            if len(parts) != 2:
+                continue
+            home, away = parts[0], parts[1]
+            rows = conn.run("""
+                SELECT match_id FROM odds_snapshots
+                WHERE home_team = :h AND away_team = :a
+                ORDER BY captured_at DESC LIMIT 1
+            """, h=home, a=away)
+            if not rows:
+                continue
+            match_id = rows[0][0]
+
+            # Mark as completed (first time we see FT)
+            conn.run("""
+                INSERT INTO match_completions
+                (match_id, final_score_home, final_score_away, final_minute)
+                VALUES (:mid, :sh, :sa, :m)
+                ON CONFLICT (match_id) DO UPDATE SET
+                    final_score_home = EXCLUDED.final_score_home,
+                    final_score_away = EXCLUDED.final_score_away,
+                    final_minute = EXCLUDED.final_minute
+            """, mid=match_id, sh=ft["sh"], sa=ft["sa"], m=ft["minute"])
+    except Exception as e:
+        log.error(f"mark_completed error: {e}")
+    finally:
+        conn.close()
+
+
+def validate_finished_matches():
+    """Validate all unresolved signals for matches that finished
+    at least FT_STABILITY_MINUTES ago.
+
+    Win/Loss logic:
+    - OVER signals: at least 1 goal scored AFTER signal minute
+    - UNDER signals: NO goals scored after signal minute
+    """
+    conn = get_db()
+    try:
+        # Find completions that are stable (FT for 10+ minutes) and not yet validated
+        stable = conn.run(f"""
+            SELECT match_id, final_score_home, final_score_away, final_minute
+            FROM match_completions
+            WHERE validated_at IS NULL
+              AND first_seen_ft < NOW() - INTERVAL '{FT_STABILITY_MINUTES} minutes'
+        """)
+
+        for completion in stable:
+            match_id, fsh, fsa, fmin = completion
+
+            # Get all unvalidated signals for this match
+            signals_to_validate = conn.run("""
+                SELECT s.id, s.rule_id, s.rule_number, s.prediction, s.market,
+                       s.match_minute, s.score_home, s.score_away, s.over_price
+                FROM signals s
+                LEFT JOIN signal_results r ON r.signal_id = s.id
+                WHERE s.match_id = :mid AND r.id IS NULL
+            """, mid=match_id)
+
+            for sig in signals_to_validate:
+                sig_id, rule_id, rule_num, pred, market, sig_min, sig_sh, sig_sa, odds = sig
+
+                # Calculate goals scored after the signal
+                sig_total = (sig_sh or 0) + (sig_sa or 0)
+                final_total = (fsh or 0) + (fsa or 0)
+                goals_after = max(0, final_total - sig_total)
+
+                # Determine result
+                if pred == "OVER":
+                    result = "win" if goals_after >= 1 else "loss"
+                elif pred == "UNDER":
+                    result = "win" if goals_after == 0 else "loss"
+                else:
+                    result = "unknown"
+
+                # Calculate profit (100 unit stake)
+                if result == "win" and odds:
+                    profit = round((float(odds) - 1.0) * 100, 2)
+                elif result == "loss":
+                    profit = -100.0
+                else:
+                    profit = 0.0
+
+                # Save result
+                conn.run("""
+                    INSERT INTO signal_results
+                    (signal_id, match_id, rule_id, rule_number, prediction, market,
+                     signal_minute, signal_score_home, signal_score_away, signal_odds,
+                     final_minute, final_score_home, final_score_away, final_period,
+                     goals_after_signal, result, profit)
+                    VALUES (:sid, :mid, :rid, :rnum, :pr, :mk,
+                            :smin, :ssh, :ssa, :odds,
+                            :fmin, :fsh, :fsa, :fper,
+                            :ga, :res, :prof)
+                    ON CONFLICT (signal_id) DO NOTHING
+                """,
+                sid=sig_id, mid=match_id, rid=rule_id, rnum=rule_num,
+                pr=pred, mk=market,
+                smin=sig_min, ssh=sig_sh, ssa=sig_sa, odds=odds,
+                fmin=fmin, fsh=fsh, fsa=fsa, fper="FT",
+                ga=goals_after, res=result, prof=profit)
+
+                log.info(f"✅ Validated {rule_id} {pred} → {result.upper()} "
+                         f"({sig_sh}-{sig_sa} → {fsh}-{fsa}) profit={profit}")
+
+            # Mark the completion as validated
+            conn.run("""
+                UPDATE match_completions SET validated_at = NOW()
+                WHERE match_id = :mid
+            """, mid=match_id)
+
+    except Exception as e:
+        log.error(f"Validation error: {e}", exc_info=True)
+    finally:
+        conn.close()
+
+
 # ─── Odds Collector ──────────────────────────────────────
 def collect_odds():
     if not ODDS_API_KEY:
@@ -597,10 +775,17 @@ def collect_odds():
 def collector_loop():
     time.sleep(5)
     fetch_live_minutes()
+    iteration = 0
     while True:
         try:
             collect_odds()
             fetch_live_minutes()
+            mark_completed_matches()
+
+            # Run validation every 4 iterations (~ every 2 minutes)
+            iteration += 1
+            if iteration % 4 == 0:
+                validate_finished_matches()
         except Exception as e:
             log.error(f"Loop error: {e}")
         time.sleep(POLL_INTERVAL)
@@ -667,6 +852,19 @@ td{padding:10px 12px;border-top:1px solid var(--border)88}
 .empty{text-align:center;padding:40px;color:var(--muted)}
 .pu{color:var(--red)}
 .pd{color:var(--green)}
+.result-tag{display:inline-block;padding:3px 10px;border-radius:4px;font-size:11px;font-weight:700;letter-spacing:1px;margin-left:8px}
+.result-tag.win{background:var(--green)33;color:var(--green);border:1px solid var(--green)66}
+.result-tag.loss{background:var(--red)33;color:var(--red);border:1px solid var(--red)66}
+.result-tag.pending{background:#ffffff0a;color:var(--muted);border:1px solid var(--border)}
+.profit-up{color:var(--green);font-weight:700}
+.profit-down{color:var(--red);font-weight:700}
+.perf-table th{text-align:center}
+.perf-table td{text-align:center;font-family:'IBM Plex Mono',monospace}
+.perf-table .rule-cell{text-align:right;font-weight:700}
+.perf-table .win-rate{font-weight:700}
+.perf-table .win-rate.good{color:var(--green)}
+.perf-table .win-rate.medium{color:var(--yellow)}
+.perf-table .win-rate.bad{color:var(--red)}
 .goal-section{background:var(--card);border:1px solid #ff335544;border-radius:12px;padding:20px;margin-bottom:32px}
 .goal-form{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}
 .finput{background:#ffffff0a;border:1px solid var(--border);border-radius:8px;color:var(--text);padding:8px 12px;font-size:14px;width:100%}
@@ -685,6 +883,7 @@ td{padding:10px 12px;border-top:1px solid var(--border)88}
     <a href="/api/export/observations" class="dl-btn" download>📥 תצפיות</a>
     <a href="/api/export/signals" class="dl-btn" download>📥 אותות</a>
     <a href="/api/export/goals" class="dl-btn" download>📥 גולים</a>
+    <a href="/api/export/results" class="dl-btn" download>📥 תוצאות</a>
   </div>
 </header>
 
@@ -696,6 +895,12 @@ td{padding:10px 12px;border-top:1px solid var(--border)88}
 <div class="sc"><div class="sn" style="color:var(--yellow)" id="d">—</div><div class="sl">דגימות נשמרו</div></div>
 <div class="sc"><div class="sn" style="color:var(--orange)" id="gl">—</div><div class="sl">גולים מוקלטים</div></div>
 </div>
+
+<div class="st">📈 ביצועי חוקים (30 ימים אחרונים)</div>
+<div class="tw"><table class="perf-table">
+<thead><tr><th style="text-align:right">חוק</th><th>סה"כ</th><th>נצחונות</th><th>הפסדים</th><th>אחוז הצלחה</th><th>רווח מצטבר</th><th>ממוצע</th></tr></thead>
+<tbody id="perfBody"><tr><td colspan="7" class="empty">אין תוצאות עדיין — ימתינו לסיום משחקים</td></tr></tbody>
+</table></div>
 
 <div class="st">⚽ רישום גול ידני</div>
 <div class="goal-section">
@@ -728,17 +933,38 @@ const cm={
 
 async function load(){
 try{
-const[st,si,od,ai]=await Promise.all([
+const[st,si,od,ai,perf]=await Promise.all([
   fetch('/api/stats').then(r=>r.json()),
   fetch('/api/signals').then(r=>r.json()),
   fetch('/api/odds').then(r=>r.json()),
-  fetch('/api/ai').then(r=>r.json())
+  fetch('/api/ai').then(r=>r.json()),
+  fetch('/api/stats/rules').then(r=>r.json())
 ]);
 document.getElementById('g').textContent=st.games||0;
 document.getElementById('s').textContent=st.signals_today||0;
 document.getElementById('d').textContent=(st.snapshots||0).toLocaleString();
 document.getElementById('gl').textContent=st.goals||0;
 document.getElementById('upd').textContent='עדכון: '+new Date().toLocaleTimeString('he-IL');
+
+// Performance table
+const pb=document.getElementById('perfBody');
+if(!perf.length){pb.innerHTML='<tr><td colspan="7" class="empty">אין תוצאות עדיין — ימתינו לסיום משחקים</td></tr>';}
+else{
+  pb.innerHTML=perf.map(p=>{
+    const wrClass=p.win_rate>=65?'good':(p.win_rate>=50?'medium':'bad');
+    const profitClass=p.total_profit>=0?'profit-up':'profit-down';
+    const profitSign=p.total_profit>=0?'+':'';
+    return`<tr>
+      <td class="rule-cell">${p.rule_id}</td>
+      <td>${p.total}</td>
+      <td style="color:var(--green)">${p.wins}</td>
+      <td style="color:var(--red)">${p.losses}</td>
+      <td class="win-rate ${wrClass}">${p.win_rate}%</td>
+      <td class="${profitClass}">${profitSign}${p.total_profit.toFixed(0)}</td>
+      <td class="${profitClass}">${profitSign}${p.avg_profit.toFixed(1)}</td>
+    </tr>`;
+  }).join('');
+}
 
 const aiMap={};
 ai.forEach(a=>aiMap[a.match_id]=a.analysis);
@@ -752,11 +978,23 @@ else{
     const scTag=s.slow_climb_present?'<span class="ot sc-yes">SC ✓</span>':'<span class="ot sc-no">no SC</span>';
     const gapTag=s.gap?`<span class="ot">gap ${s.gap>=0?'+':''}${parseFloat(s.gap).toFixed(2)}</span>`:'';
     const scoreTag=(s.score_home!==null&&s.score_home!==undefined)?`<span class="ot">${s.score_home}-${s.score_away||0}</span>`:'';
+
+    // Win/Loss tag
+    let resultTag='';
+    if(s.result==='win'){
+      const profitTxt=s.profit?` +${parseFloat(s.profit).toFixed(0)}`:'';
+      resultTag=`<span class="result-tag win">✅ WIN${profitTxt}</span>`;
+    }else if(s.result==='loss'){
+      resultTag=`<span class="result-tag loss">❌ LOSS -100</span>`;
+    }else{
+      resultTag=`<span class="result-tag pending">⏳ ממתין</span>`;
+    }
+
     return`<div class="scard ${c}">
       <div class="scard-top">
         <div class="rb ${c}">${s.rule_id||'R?'}</div>
         <div style="flex:1">
-          <div class="sm">${s.home_team} vs ${s.away_team}</div>
+          <div class="sm">${s.home_team} vs ${s.away_team} ${resultTag}</div>
           <div class="srn">${s.rule_name} · ${s.market||''}</div>
           <div class="or">
             <span class="ot">Over: ${s.over_price||'—'}</span>
@@ -847,20 +1085,23 @@ def api_signals():
         conn = get_db()
         try:
             rows = conn.run("""
-                SELECT id, detected_at, match_id, home_team, away_team,
-                       rule_name, rule_id, rule_number, status, market, prediction,
-                       confidence, verdict, over_price, draw_price,
-                       opening_price, gap, slow_climb_present,
-                       match_minute, score_home, score_away, details
-                FROM signals
-                WHERE detected_at > NOW() - INTERVAL '30 minutes'
-                ORDER BY detected_at DESC LIMIT 30
+                SELECT s.id, s.detected_at, s.match_id, s.home_team, s.away_team,
+                       s.rule_name, s.rule_id, s.rule_number, s.status, s.market, s.prediction,
+                       s.confidence, s.verdict, s.over_price, s.draw_price,
+                       s.opening_price, s.gap, s.slow_climb_present,
+                       s.match_minute, s.score_home, s.score_away, s.details,
+                       r.result, r.profit, r.goals_after_signal
+                FROM signals s
+                LEFT JOIN signal_results r ON r.signal_id = s.id
+                WHERE s.detected_at > NOW() - INTERVAL '24 hours'
+                ORDER BY s.detected_at DESC LIMIT 50
             """)
             cols = ["id","detected_at","match_id","home_team","away_team",
                     "rule_name","rule_id","rule_number","status","market","prediction",
                     "confidence","verdict","over_price","draw_price",
                     "opening_price","gap","slow_climb_present",
-                    "match_minute","score_home","score_away","details"]
+                    "match_minute","score_home","score_away","details",
+                    "result","profit","goals_after_signal"]
             result = [dict(zip(cols, r)) for r in rows]
             for r in result:
                 r["detected_at"] = str(r["detected_at"])
@@ -869,6 +1110,40 @@ def api_signals():
             conn.close()
     except Exception as e:
         log.error(f"signals API: {e}")
+        return jsonify([])
+
+
+@app.route("/api/stats/rules")
+def api_rule_stats():
+    """Win rate + total profit per rule (last 30 days)"""
+    try:
+        conn = get_db()
+        try:
+            rows = conn.run("""
+                SELECT rule_id,
+                       COUNT(*) as total,
+                       COUNT(*) FILTER (WHERE result = 'win') as wins,
+                       COUNT(*) FILTER (WHERE result = 'loss') as losses,
+                       COALESCE(SUM(profit), 0) as total_profit,
+                       COALESCE(AVG(profit), 0) as avg_profit
+                FROM signal_results
+                WHERE validated_at > NOW() - INTERVAL '30 days'
+                GROUP BY rule_id
+                ORDER BY rule_id
+            """)
+            cols = ["rule_id","total","wins","losses","total_profit","avg_profit"]
+            result = []
+            for r in rows:
+                d = dict(zip(cols, r))
+                d["win_rate"] = round(100.0 * d["wins"] / d["total"], 1) if d["total"] > 0 else 0
+                d["total_profit"] = float(d["total_profit"])
+                d["avg_profit"] = round(float(d["avg_profit"]), 2)
+                result.append(d)
+            return jsonify(result)
+        finally:
+            conn.close()
+    except Exception as e:
+        log.error(f"rule stats: {e}")
         return jsonify([])
 
 @app.route("/api/odds")
@@ -1055,6 +1330,41 @@ def export_goals():
             headers = ["id","recorded_at","match_id","home_team","away_team",
                        "match_minute","match_score","over_price_30s","over_price_60s","notes"]
             return csv_response(rows, headers, "papagoal_goals")
+        finally:
+            conn.close()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/export/results")
+def export_results():
+    """Export validation results — the key dataset for analyzing rule performance"""
+    try:
+        days = request.args.get("days", default=90, type=int)
+        conn = get_db()
+        try:
+            rows = conn.run(f"""
+                SELECT r.id, r.validated_at, r.signal_id,
+                       r.match_id, s.home_team, s.away_team,
+                       r.rule_id, r.rule_number, s.rule_name,
+                       r.prediction, r.market,
+                       r.signal_minute, r.signal_score_home, r.signal_score_away,
+                       r.signal_odds,
+                       r.final_minute, r.final_score_home, r.final_score_away,
+                       r.goals_after_signal, r.result, r.profit,
+                       s.slow_climb_present, s.gap, s.opening_price
+                FROM signal_results r
+                LEFT JOIN signals s ON s.id = r.signal_id
+                WHERE r.validated_at > NOW() - INTERVAL '{int(days)} days'
+                ORDER BY r.validated_at DESC
+            """)
+            headers = ["id","validated_at","signal_id","match_id","home_team","away_team",
+                       "rule_id","rule_number","rule_name","prediction","market",
+                       "signal_minute","signal_score_home","signal_score_away","signal_odds",
+                       "final_minute","final_score_home","final_score_away",
+                       "goals_after_signal","result","profit",
+                       "slow_climb_present","gap","opening_price"]
+            return csv_response(rows, headers, "papagoal_results")
         finally:
             conn.close()
     except Exception as e:

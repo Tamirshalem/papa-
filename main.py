@@ -21,8 +21,9 @@ import pg8000.native
 import requests
 
 # ─── Config ──────────────────────────────────────────────
-ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "")
-FOOTBALL_API_KEY = os.environ.get("FOOTBALL_API_KEY", "")
+ODDS_API_KEY = os.environ.get("ODDSAPI_KEY", "")
+FOOTBALL_API_KEY = os.environ.get("APIFOOTBALL_KEY", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 PORT = int(os.environ.get("PORT", 8080))
 POLL_INTERVAL = 30  # seconds
@@ -50,7 +51,6 @@ def get_db():
 def init_db():
     conn = get_db()
     try:
-        # odds_snapshots with match_minute + score support
         conn.run("""
             CREATE TABLE IF NOT EXISTS odds_snapshots (
                 id SERIAL PRIMARY KEY,
@@ -77,7 +77,7 @@ def init_db():
         conn.run("CREATE INDEX IF NOT EXISTS idx_captured_at ON odds_snapshots(captured_at)")
         conn.run("CREATE INDEX IF NOT EXISTS idx_match_minute ON odds_snapshots(match_minute)")
 
-        # Add new columns if they don't exist (migration for existing DBs)
+        # Migration for existing DB
         for col_def in [
             "match_minute INT",
             "match_period TEXT",
@@ -131,7 +131,6 @@ def init_db():
                 details TEXT
             )
         """)
-        # Migration for existing signals table
         for col_def in [
             "match_minute INT",
             "score_home INT",
@@ -160,8 +159,8 @@ def init_db():
 live_match_minutes = {}
 
 def fetch_live_minutes():
-    """Fetch live match minutes + scores from API-Football"""
     if not FOOTBALL_API_KEY:
+        log.warning("APIFOOTBALL_KEY not set — skipping live minutes")
         return
     try:
         headers = {"x-apisports-key": FOOTBALL_API_KEY}
@@ -198,7 +197,6 @@ def fetch_live_minutes():
         log.error(f"Football API error: {e}")
 
 def get_match_state(home, away):
-    """Find minute + score for a match, with fuzzy fallback"""
     key = (home + "_" + away).lower()
     if key in live_match_minutes:
         return live_match_minutes[key]
@@ -215,7 +213,6 @@ def get_match_state(home, away):
 opening_odds = {}
 
 def get_opening_price(match_id, market, outcome, current_price):
-    """Get or set opening price for a match+market+outcome"""
     key = f"{match_id}_{market}_{outcome}"
     if key not in opening_odds:
         opening_odds[key] = current_price
@@ -226,13 +223,6 @@ def get_opening_price(match_id, market, outcome, current_price):
 def check_slow_climb(conn, match_id, market, outcome,
                     observations=4, step_min=0.02, step_max=0.05,
                     direction="UP"):
-    """
-    Detect Slow Climb Pattern in recent observations.
-
-    Returns True if the last N observations show:
-    - Consistent direction (all UP or all DOWN)
-    - Each step between step_min and step_max
-    """
     try:
         rows = conn.run("""
             SELECT price, captured_at
@@ -265,18 +255,9 @@ def check_slow_climb(conn, match_id, market, outcome,
 def run_engine(conn, match_id, home, away,
                over_ft, over_ht, draw, home_win, away_win,
                minute, score_home, score_away, opening_over_ft, opening_over_ht):
-    """
-    Run all 10 rules. Returns list of triggered signals.
-
-    Slow Climb Pattern is applied as:
-    - REQUIRED for OVER rules (must be present)
-    - ABSENT for UNDER rules (must NOT be present)
-    """
     signals = []
     o_ft = over_ft or 0
     o_ht = over_ht or 0
-    d = draw or 0
-    hw = home_win or 0
     m = minute or 0
     total_goals = (score_home or 0) + (score_away or 0)
 
@@ -297,8 +278,7 @@ def run_engine(conn, match_id, home, away,
             "details": details
         })
 
-    # ═══ R1 · Market Shut (UNDER) ═══
-    # Slow Climb must be ABSENT
+    # R1 · Market Shut (UNDER) — Slow Climb must be ABSENT
     if m >= 82 and o_ft >= 2.70:
         sc = has_slow_climb("totals")
         if not sc:
@@ -306,7 +286,7 @@ def run_engine(conn, match_id, home, away,
                        88, False,
                        details=f"Minute {m}, FT Over {o_ft:.2f}, no slow climb detected")
 
-    # ═══ R2 · Early Drop Signal (OVER) ═══
+    # R2 · Early Drop Signal (OVER) — Slow Climb REQUIRED
     if 16 <= m <= 20 and 1.40 <= o_ht <= 1.66:
         sc = has_slow_climb("totals_h1")
         if sc:
@@ -314,7 +294,7 @@ def run_engine(conn, match_id, home, away,
                        86, True,
                        details=f"Minute {m}, HT Over {o_ht:.2f}, slow climb confirmed")
 
-    # ═══ R3 · H1 Mid Pressure (OVER) ═══
+    # R3 · H1 Mid Pressure (OVER)
     if 30 <= m <= 35 and 1.80 <= o_ht <= 2.10 and total_goals <= 1:
         sc = has_slow_climb("totals_h1")
         if sc:
@@ -322,7 +302,7 @@ def run_engine(conn, match_id, home, away,
                        78, True,
                        details=f"Minute {m}, HT Over {o_ht:.2f}, goals {total_goals}, slow climb confirmed")
 
-    # ═══ R4 · H1 Mid Shut (UNDER) ═══
+    # R4 · H1 Mid Shut (UNDER)
     if 30 <= m <= 35 and o_ht >= 2.60:
         sc = has_slow_climb("totals_h1")
         if not sc:
@@ -330,7 +310,7 @@ def run_engine(conn, match_id, home, away,
                        75, False,
                        details=f"Minute {m}, HT Over {o_ht:.2f}, no slow climb detected")
 
-    # ═══ R5 · Late FT Goal Hold (OVER) ═══
+    # R5 · Late FT Goal Hold (OVER)
     if 83 <= m <= 95 and 2.10 <= o_ft <= 3.00:
         sc = has_slow_climb("totals")
         if sc:
@@ -338,7 +318,7 @@ def run_engine(conn, match_id, home, away,
                        80, True,
                        details=f"Minute {m}, FT Over {o_ft:.2f}, slow climb confirmed")
 
-    # ═══ R6 · H1 Opening Gap Signal (OVER) ═══
+    # R6 · H1 Opening Gap Signal (OVER)
     if 25 <= m <= 40 and 1.70 <= o_ht <= 3.50 and opening_over_ht:
         gap = o_ht - opening_over_ht
         if gap >= 0.50:
@@ -348,7 +328,7 @@ def run_engine(conn, match_id, home, away,
                            82, True, gap=gap,
                            details=f"Minute {m}, HT Over {o_ht:.2f}, gap +{gap:.2f}, slow climb confirmed")
 
-    # ═══ R7 · Next Goal Imminent (OVER) ═══
+    # R7 · Next Goal Imminent (OVER)
     if m >= 77 and 1.65 <= o_ft <= 1.79:
         sc = has_slow_climb("totals")
         if sc:
@@ -356,7 +336,7 @@ def run_engine(conn, match_id, home, away,
                        82, True,
                        details=f"Minute {m}, Next-goal Over {o_ft:.2f}, slow climb confirmed (score {score_home}-{score_away})")
 
-    # ═══ R8 · Slow Climb Pressure (OVER) ═══
+    # R8 · Slow Climb Pressure (OVER)
     if 65 <= m <= 80 and 1.45 <= o_ft <= 1.55:
         sc = has_slow_climb("totals")
         if sc:
@@ -364,7 +344,7 @@ def run_engine(conn, match_id, home, away,
                        85, True,
                        details=f"Minute {m}, Over {o_ft:.2f} climbing slowly — goal imminent")
 
-    # ═══ R9 · H1 Goal Rush Window (OVER) ═══
+    # R9 · H1 Goal Rush Window (OVER)
     if 25 <= m <= 35 and 1.55 <= o_ht <= 1.75:
         sc = has_slow_climb("totals_h1")
         if sc:
@@ -372,7 +352,7 @@ def run_engine(conn, match_id, home, away,
                        72, True,
                        details=f"Minute {m}, HT Over {o_ht:.2f}, slow climb confirmed")
 
-    # ═══ R10 · FT Late Comeback Signal (OVER) ═══
+    # R10 · FT Late Comeback Signal (OVER)
     if 60 <= m <= 75 and 1.65 <= o_ft <= 1.95 and total_goals >= 1:
         sc = has_slow_climb("totals")
         if sc:
@@ -387,6 +367,9 @@ def run_engine(conn, match_id, home, away,
 last_prices = {}
 
 def collect_odds():
+    if not ODDS_API_KEY:
+        log.warning("ODDSAPI_KEY not set — skipping collection")
+        return
     try:
         url = "https://api.the-odds-api.com/v4/sports/soccer/odds/"
         params = {
@@ -537,16 +520,9 @@ DASHBOARD_HTML = """
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #04342C;
-    --bg-soft: #052D26;
-    --card: #0A4338;
-    --border: #1D5C4F;
-    --green: #1D9E75;
-    --green-soft: #5DCAA5;
-    --red: #E04545;
-    --yellow: #EF9F27;
-    --text: #E0F2EC;
-    --muted: #7A9990;
+    --bg: #04342C; --bg-soft: #052D26; --card: #0A4338;
+    --border: #1D5C4F; --green: #1D9E75; --green-soft: #5DCAA5;
+    --red: #E04545; --yellow: #EF9F27; --text: #E0F2EC; --muted: #7A9990;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--text); font-family: 'Inter', sans-serif; min-height: 100vh; }
@@ -837,71 +813,4 @@ def export_observations():
             conn.close()
     except Exception as e:
         log.error(f"Export observations error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/api/export/signals")
-def export_signals():
-    try:
-        days = request.args.get("days", default=30, type=int)
-        conn = get_db()
-        try:
-            rows = conn.run(f"""
-                SELECT id, detected_at, match_id, home_team, away_team,
-                       match_minute, score_home, score_away,
-                       rule_id, rule_name, status, market, prediction,
-                       over_price, draw_price, opening_price, gap,
-                       slow_climb_present, confidence, details
-                FROM signals
-                WHERE detected_at > NOW() - INTERVAL '{int(days)} days'
-                ORDER BY detected_at DESC
-            """)
-            headers = ["id","detected_at","match_id","home_team","away_team",
-                       "match_minute","score_home","score_away",
-                       "rule_id","rule_name","status","market","prediction",
-                       "over_price","draw_price","opening_price","gap",
-                       "slow_climb_present","confidence","details"]
-            return csv_response(rows, headers, "papagoal_signals")
-        finally:
-            conn.close()
-    except Exception as e:
-        log.error(f"Export signals error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/api/export/goals")
-def export_goals():
-    try:
-        conn = get_db()
-        try:
-            rows = conn.run("""
-                SELECT id, recorded_at, match_id, home_team, away_team,
-                       match_minute, score, over_price_30s, over_price_60s, notes
-                FROM goals
-                ORDER BY recorded_at DESC
-            """)
-            headers = ["id","recorded_at","match_id","home_team","away_team",
-                       "match_minute","score","over_price_30s","over_price_60s","notes"]
-            return csv_response(rows, headers, "papagoal_goals")
-        finally:
-            conn.close()
-    except Exception as e:
-        log.error(f"Export goals error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/health")
-def health():
-    return jsonify({
-        "status": "ok",
-        "time": datetime.now(timezone.utc).isoformat(),
-        "live_matches": len(live_match_minutes)
-    })
-
-
-# ─── Start ──────────────────────────────────────────────
-if __name__ == "__main__":
-    log.info("🚀 PapaGoal v3 starting...")
-    init_db()
-    t = threading.Thread(target=collector_loop, daemon=True)
-    t.start()
-    log.info(f"📡 Collector started — polling every {POLL_INTERVAL}s")
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+        return jso

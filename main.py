@@ -2156,6 +2156,166 @@ Return ONLY JSON: {json_example}"""
         finally: release_db(conn)
     except Exception as e: return jsonify({"error":str(e)}),500
 
+EXPORTABLE_TABLES = {
+    "observations": {
+        "cols": ["id","mid","detected_at","home","away","league","rule_id","rule_name",
+                 "minute","score","mtype","line","over_odd","under_odd","expected_odd",
+                 "gap","pressure","action_type","selected_side","entry_odd","confidence","reason"],
+        "order": "detected_at DESC"
+    },
+    "trades": {
+        "cols": ["id","mid","rule_id","rule_name","created_at","resolved_at","home","away",
+                 "league","mtype","line","side","action_type","entry_odd","expected_odd",
+                 "entry_min","entry_goals","score_entry","gap","pressure","validation_window",
+                 "result","profit","fail_reason"],
+        "order": "created_at DESC"
+    },
+    "matches": {
+        "cols": ["id","mid","eid","home","away","league","minute","score_home","score_away",
+                 "total_goals","period","updated_at"],
+        "order": "updated_at DESC"
+    },
+    "goals": {
+        "cols": ["id","mid","minute","goal_time","score_before","score_after","period",
+                 "home","away","league"],
+        "order": "goal_time DESC"
+    },
+    "rules": {
+        "cols": ["id","rule_name","description","source","mtype","line_min","line_max",
+                 "min_min","min_max","over_min","over_max","under_min","under_max","held_min",
+                 "action_type","side","val_window","status","is_active","total_signals",
+                 "wins","losses","win_rate","profit","created_at","updated_at"],
+        "order": "id ASC"
+    },
+    "odds_snapshots": {
+        "cols": ["id","mid","minute","mtype","line","over_odd","under_odd","saved_at"],
+        "order": "saved_at DESC"
+    },
+    "opening_odds": {
+        "cols": ["id","mid","home","away","league","mtype","line","over_open","under_open","saved_at"],
+        "order": "saved_at DESC"
+    },
+    "key_minutes": {
+        "cols": ["id","mid","minute","score_home","score_away","over_ft","under_ft",
+                 "dangerous_attacks_home","dangerous_attacks_away","saved_at"],
+        "order": "saved_at DESC"
+    },
+    "match_stats": {
+        "cols": ["id","mid","minute","dangerous_attacks_home","dangerous_attacks_away",
+                 "shots_home","shots_away","possession_home","saved_at"],
+        "order": "saved_at DESC"
+    },
+    "insights": {
+        "cols": ["id","created_at","itype","content","goals_n","rules_n"],
+        "order": "created_at DESC"
+    },
+}
+
+@app.route("/export")
+def export_data():
+    """Bulk data export with pagination.
+
+    Query params:
+      table  - one of the EXPORTABLE_TABLES keys, or omit for all tables
+      limit  - rows per page (default 10000, max 50000)
+      offset - starting row (default 0)
+
+    Returns JSON with data, total_count, limit, offset, has_more.
+    Content-Disposition header triggers a file download in browsers.
+    """
+    try:
+        table_param = request.args.get("table", "").strip().lower() or None
+        try:
+            limit = min(int(request.args.get("limit", 10000)), 50000)
+        except (ValueError, TypeError):
+            limit = 10000
+        try:
+            offset = max(int(request.args.get("offset", 0)), 0)
+        except (ValueError, TypeError):
+            offset = 0
+
+        if table_param and table_param not in EXPORTABLE_TABLES:
+            return jsonify({
+                "error": f"Unknown table '{table_param}'. Available: {sorted(EXPORTABLE_TABLES.keys())}"
+            }), 400
+
+        conn = get_db()
+        try:
+            if table_param:
+                # Single-table export
+                meta = EXPORTABLE_TABLES[table_param]
+                cols_sql = ", ".join(meta["cols"])
+                total = conn.run(f"SELECT COUNT(*) FROM {table_param}")[0][0]
+                rows = conn.run(
+                    f"SELECT {cols_sql} FROM {table_param} "
+                    f"ORDER BY {meta['order']} "
+                    f"LIMIT {limit} OFFSET {offset}"
+                )
+                records = []
+                for row in rows:
+                    rec = {}
+                    for k, v in zip(meta["cols"], row):
+                        rec[k] = str(v) if hasattr(v, "tzinfo") else v
+                    records.append(rec)
+
+                payload = {
+                    "table": table_param,
+                    "data": records,
+                    "total_count": int(total),
+                    "limit": limit,
+                    "offset": offset,
+                    "has_more": (offset + limit) < int(total),
+                }
+                filename = f"{table_param}_offset{offset}.json"
+            else:
+                # All-tables export (each table paginated independently)
+                payload = {
+                    "tables": {},
+                    "limit": limit,
+                    "offset": offset,
+                }
+                for tname, meta in EXPORTABLE_TABLES.items():
+                    try:
+                        cols_sql = ", ".join(meta["cols"])
+                        total = conn.run(f"SELECT COUNT(*) FROM {tname}")[0][0]
+                        rows = conn.run(
+                            f"SELECT {cols_sql} FROM {tname} "
+                            f"ORDER BY {meta['order']} "
+                            f"LIMIT {limit} OFFSET {offset}"
+                        )
+                        records = []
+                        for row in rows:
+                            rec = {}
+                            for k, v in zip(meta["cols"], row):
+                                rec[k] = str(v) if hasattr(v, "tzinfo") else v
+                            records.append(rec)
+                        total_int = int(total)
+                        payload["tables"][tname] = {
+                            "data": records,
+                            "total_count": total_int,
+                            "has_more": (offset + limit) < total_int,
+                        }
+                    except Exception as te:
+                        log.warning(f"Export table {tname}: {te}")
+                        payload["tables"][tname] = {"error": str(te)}
+                filename = f"all_tables_offset{offset}.json"
+
+        finally:
+            release_db(conn)
+
+        response = app.response_class(
+            response=json.dumps(payload, default=str),
+            status=200,
+            mimetype="application/json",
+        )
+        response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
+
+    except Exception as e:
+        log.error(f"export: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 init_db()
 threading.Thread(target=collector_loop,daemon=True).start()
 log.info("PapaGoal v7 started")

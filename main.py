@@ -2156,6 +2156,144 @@ Return ONLY JSON: {json_example}"""
         finally: release_db(conn)
     except Exception as e: return jsonify({"error":str(e)}),500
 
+@app.route("/export")
+def export_db():
+    """Export all database tables as a downloadable JSON snapshot."""
+    if not DATABASE_URL:
+        return jsonify({"error": "DATABASE_URL not configured"}), 500
+    try:
+        conn = get_db()
+        try:
+            # matches
+            match_rows = conn.run(
+                "SELECT id,mid,eid,home,away,league,minute,score_home,score_away,total_goals,period,updated_at "
+                "FROM matches ORDER BY updated_at DESC"
+            )
+            matches_data = [
+                {"id":r[0],"mid":r[1],"eid":r[2],"home":r[3],"away":r[4],"league":r[5],
+                 "minute":r[6],"score_home":r[7],"score_away":r[8],"total_goals":r[9],
+                 "period":r[10],"updated_at":str(r[11])}
+                for r in match_rows
+            ]
+
+            # goals
+            goal_rows = conn.run(
+                "SELECT id,mid,minute,goal_time,score_before,score_after,period,home,away,league "
+                "FROM goals ORDER BY goal_time DESC"
+            )
+            goals_data = [
+                {"id":r[0],"mid":r[1],"minute":r[2],"goal_time":str(r[3]),
+                 "score_before":r[4],"score_after":r[5],"period":r[6],
+                 "home":r[7],"away":r[8],"league":r[9]}
+                for r in goal_rows
+            ]
+
+            # observations
+            obs_rows = conn.run(
+                "SELECT id,mid,detected_at,home,away,league,rule_id,rule_name,minute,score,"
+                "mtype,line,over_odd,under_odd,expected_odd,gap,pressure,"
+                "action_type,selected_side,entry_odd,confidence,reason "
+                "FROM observations ORDER BY detected_at DESC"
+            )
+            obs_cols = ["id","mid","detected_at","home","away","league","rule_id","rule_name",
+                        "minute","score","mtype","line","over_odd","under_odd","expected_odd",
+                        "gap","pressure","action_type","selected_side","entry_odd","confidence","reason"]
+            observations_data = [dict(zip(obs_cols, r)) for r in obs_rows]
+            for r in observations_data:
+                r["detected_at"] = str(r["detected_at"])
+
+            # trades
+            trade_rows = conn.run(
+                "SELECT id,mid,rule_id,rule_name,created_at,resolved_at,home,away,league,"
+                "mtype,line,side,action_type,entry_odd,expected_odd,entry_min,entry_goals,"
+                "score_entry,gap,pressure,validation_window,result,profit,fail_reason "
+                "FROM trades ORDER BY created_at DESC"
+            )
+            trade_cols = ["id","mid","rule_id","rule_name","created_at","resolved_at","home","away","league",
+                          "mtype","line","side","action_type","entry_odd","expected_odd","entry_min","entry_goals",
+                          "score_entry","gap","pressure","validation_window","result","profit","fail_reason"]
+            trades_data = [dict(zip(trade_cols, r)) for r in trade_rows]
+            for r in trades_data:
+                r["created_at"] = str(r["created_at"])
+                r["resolved_at"] = str(r["resolved_at"]) if r["resolved_at"] else None
+
+            # rules
+            rule_rows = conn.run(
+                "SELECT id,rule_name,description,source,mtype,line_min,line_max,min_min,min_max,"
+                "over_min,over_max,under_min,under_max,action_type,side,val_window,status,is_active,"
+                "total_signals,wins,losses,win_rate,profit,created_at,updated_at "
+                "FROM rules ORDER BY id"
+            )
+            rule_cols = ["id","rule_name","description","source","mtype","line_min","line_max",
+                         "min_min","min_max","over_min","over_max","under_min","under_max",
+                         "action_type","side","val_window","status","is_active",
+                         "total_signals","wins","losses","win_rate","profit","created_at","updated_at"]
+            rules_data = [dict(zip(rule_cols, r)) for r in rule_rows]
+            for r in rules_data:
+                r["created_at"] = str(r["created_at"])
+                r["updated_at"] = str(r["updated_at"])
+
+            # insights
+            insight_rows = conn.run(
+                "SELECT id,created_at,itype,content,goals_n,rules_n "
+                "FROM insights ORDER BY created_at DESC"
+            )
+            insights_data = [
+                {"id":r[0],"created_at":str(r[1]),"itype":r[2],"content":r[3],
+                 "goals_n":r[4],"rules_n":r[5]}
+                for r in insight_rows
+            ]
+
+            # opening_odds
+            opening_rows = conn.run(
+                "SELECT id,mid,home,away,league,mtype,line,over_open,under_open,saved_at "
+                "FROM opening_odds ORDER BY saved_at DESC"
+            )
+            opening_data = [
+                {"id":r[0],"mid":r[1],"home":r[2],"away":r[3],"league":r[4],
+                 "mtype":r[5],"line":float(r[6]) if r[6] is not None else None,
+                 "over_open":float(r[7]) if r[7] is not None else None,
+                 "under_open":float(r[8]) if r[8] is not None else None,
+                 "saved_at":str(r[9])}
+                for r in opening_rows
+            ]
+
+            payload = {
+                "exported_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "counts": {
+                    "matches": len(matches_data),
+                    "goals": len(goals_data),
+                    "observations": len(observations_data),
+                    "trades": len(trades_data),
+                    "rules": len(rules_data),
+                    "insights": len(insights_data),
+                    "opening_odds": len(opening_data),
+                },
+                "matches": matches_data,
+                "goals": goals_data,
+                "observations": observations_data,
+                "trades": trades_data,
+                "rules": rules_data,
+                "insights": insights_data,
+                "opening_odds": opening_data,
+            }
+
+            filename = "papa-export-" + datetime.now(timezone.utc).strftime("%Y%m%d") + ".json"
+            response = app.response_class(
+                response=json.dumps(payload, indent=2, default=str),
+                status=200,
+                mimetype="application/json"
+            )
+            response.headers["Content-Disposition"] = f"attachment; filename={filename}"
+            log.info(f"Export: {filename} -- {sum(payload['counts'].values())} total rows")
+            return response
+        finally:
+            release_db(conn)
+    except Exception as e:
+        log.error(f"export: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 init_db()
 threading.Thread(target=collector_loop,daemon=True).start()
 log.info("PapaGoal v7 started")
